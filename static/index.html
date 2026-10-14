@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#080b12">
+  <title>Bybit Signal Desk</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body { background: #080b12; color: #e5e7eb; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    .panel { background: linear-gradient(145deg, rgba(20,27,41,.94), rgba(13,18,29,.96)); border: 1px solid #202a3a; }
+    .muted { color: #8290a5; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+    .up { color: #39d98a; }
+    .down { color: #ff6577; }
+    .signal-row { animation: appear .35s ease-out; }
+    @keyframes appear { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+  </style>
+</head>
+<body class="min-h-screen">
+  <main class="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+    <header class="mb-8 flex flex-wrap items-center justify-between gap-4">
+      <div class="flex items-center gap-3">
+        <div class="grid h-11 w-11 place-items-center rounded-xl bg-amber-400/10 text-xl text-amber-300">◈</div>
+        <div>
+          <h1 class="text-xl font-semibold tracking-tight text-white">Signal Desk <span class="text-amber-300">/ BYBIT</span></h1>
+          <p class="mt-1 text-xs muted">USDT Perpetual · BTCUSDT / ETHUSDT · сигналы, не торговые рекомендации</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <span id="connection" class="inline-flex items-center gap-2 rounded-full border border-slate-700 px-3 py-1.5 text-xs muted">
+          <span id="connection-dot" class="h-2 w-2 rounded-full bg-slate-500"></span><span id="connection-label">Подключение...</span>
+        </span>
+        <button id="sound-toggle" class="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:border-amber-300/60" aria-pressed="false">Звук: выкл.</button>
+      </div>
+    </header>
+
+    <section class="mb-6 grid gap-4 sm:grid-cols-2">
+      <article class="panel rounded-2xl p-5">
+        <div class="flex items-center justify-between"><span class="text-sm font-medium text-slate-300">BTC / USDT</span><span class="rounded-md bg-slate-800 px-2 py-1 text-[10px] text-slate-400">LINEAR</span></div>
+        <div id="price-BTCUSDT" class="mono mt-3 text-3xl font-semibold tracking-tight text-white">—</div>
+        <div class="mt-2 text-xs muted">Последняя цена · Bybit WebSocket</div>
+      </article>
+      <article class="panel rounded-2xl p-5">
+        <div class="flex items-center justify-between"><span class="text-sm font-medium text-slate-300">ETH / USDT</span><span class="rounded-md bg-slate-800 px-2 py-1 text-[10px] text-slate-400">LINEAR</span></div>
+        <div id="price-ETHUSDT" class="mono mt-3 text-3xl font-semibold tracking-tight text-white">—</div>
+        <div class="mt-2 text-xs muted">Последняя цена · Bybit WebSocket</div>
+      </article>
+    </section>
+
+    <section class="panel overflow-hidden rounded-2xl">
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-4">
+        <div><h2 class="font-semibold text-white">Торговые сигналы</h2><p class="mt-1 text-xs muted">Таймфреймы 5m / 15m · EMA 50/200 · MACD · RSI · ATR</p></div>
+        <div class="flex items-center gap-2 text-xs muted"><span id="active-count" class="rounded-full bg-slate-800 px-2.5 py-1">0 активных</span><span>Обновление в реальном времени</span></div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full min-w-[1050px] text-left text-xs">
+          <thead class="bg-slate-950/40 text-[10px] uppercase tracking-wider text-slate-500">
+            <tr>
+              <th class="px-5 py-3 font-medium">Инструмент / время</th><th class="px-4 py-3 font-medium">Сторона</th>
+              <th class="px-4 py-3 font-medium">Entry</th><th class="px-4 py-3 font-medium">Stop-loss</th>
+              <th class="px-4 py-3 font-medium">TP1 <span class="text-slate-600">40%</span></th>
+              <th class="px-4 py-3 font-medium">TP2 <span class="text-slate-600">40%</span></th>
+              <th class="px-4 py-3 font-medium">TP3 <span class="text-slate-600">20%</span></th>
+              <th class="px-4 py-3 font-medium">RSI / статус</th>
+            </tr>
+          </thead>
+          <tbody id="signals-body" class="divide-y divide-slate-800/80">
+            <tr id="empty-row"><td colspan="8" class="px-5 py-14 text-center"><div class="mb-2 text-2xl text-slate-600">⌁</div><p class="text-sm text-slate-300">Ожидание подтвержденных сигналов</p><p class="mt-1 text-xs muted">Сигналы формируются после закрытия свечи</p></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="flex flex-wrap items-center justify-between gap-2 border-t border-slate-800 px-5 py-3 text-[11px] muted">
+        <span>После достижения TP1 стоп переносится на Entry. SL учитывает ATR и локальный экстремум.</span>
+        <span>Система только генерирует сигналы и не размещает ордера.</span>
+      </div>
+    </section>
+    <footer class="mt-5 flex flex-wrap justify-between gap-2 text-[11px] muted">
+      <span>Публичные рыночные данные Bybit · никаких API-ключей не требуется</span><span id="last-update">Ожидание данных...</span>
+    </footer>
+  </main>
+  <script>
+    const byId = (id) => document.getElementById(id);
+    const signals = new Map();
+    let audioEnabled = false;
+    let audioContext;
+    let socket;
+    const formatPrice = (number) => Number(number).toLocaleString("en-US", {
+      minimumFractionDigits: number >= 1000 ? 2 : 2,
+      maximumFractionDigits: number >= 1000 ? 2 : 5
+    });
+
+    function setConnection(connected, label) {
+      byId("connection-label").textContent = label;
+      byId("connection-dot").className = `h-2 w-2 rounded-full ${connected ? "bg-emerald-400" : "bg-rose-400"}`;
+      byId("connection").className = `inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs ${connected ? "border-emerald-900 text-emerald-300" : "border-rose-900 text-rose-300"}`;
+    }
+
+    function notifySound() {
+      if (!audioEnabled) return;
+      try {
+        audioContext ||= new (window.AudioContext || window.webkitAudioContext)();
+        if (audioContext.state === "suspended") audioContext.resume();
+        const oscillator = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        oscillator.type = "sine";
+        oscillator.frequency.value = 880;
+        gain.gain.setValueAtTime(0.12, audioContext.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.3);
+        oscillator.connect(gain); gain.connect(audioContext.destination);
+        oscillator.start(); oscillator.stop(audioContext.currentTime + 0.3);
+      } catch (error) { console.error("Не удалось воспроизвести уведомление:", error); }
+    }
+
+    function statusMarkup(signal) {
+      const styles = {
+        ACTIVE: ["Активен", "bg-amber-400/10 text-amber-300"],
+        COMPLETED: ["TP3 достигнут", "bg-emerald-400/10 text-emerald-300"],
+        BREAKEVEN: ["Безубыток", "bg-sky-400/10 text-sky-300"],
+        STOPPED: ["Стоп", "bg-rose-400/10 text-rose-300"]
+      };
+      const [label, style] = styles[signal.status] || styles.ACTIVE;
+      const be = signal.breakeven ? " · BE" : "";
+      return `<span class="whitespace-nowrap rounded-md px-2 py-1 ${style}">${label}${be}</span>`;
+    }
+
+    function renderSignals() {
+      const body = byId("signals-body");
+      const sorted = [...signals.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
+      byId("active-count").textContent = `${sorted.filter((s) => s.status === "ACTIVE").length} активных`;
+      if (!sorted.length) {
+        body.innerHTML = '<tr id="empty-row"><td colspan="8" class="px-5 py-14 text-center"><div class="mb-2 text-2xl text-slate-600">⌁</div><p class="text-sm text-slate-300">Ожидание подтвержденных сигналов</p><p class="mt-1 text-xs muted">Сигналы формируются после закрытия свечи</p></td></tr>';
+        return;
+      }
+      body.innerHTML = sorted.map((s) => {
+        const sideClass = s.side === "LONG" ? "up" : "down";
+        const sideLabel = s.side === "LONG" ? "LONG" : "SHORT";
+        const time = new Date(s.created_at).toLocaleString("ru-RU", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
+        const targets = s.take_profits.map((tp, i) => `<span class="${s.hit_targets.includes(i + 1) ? "text-emerald-300" : "text-slate-200"}">${formatPrice(tp)}${s.hit_targets.includes(i + 1) ? " ✓" : ""}</span>`);
+        return `<tr class="signal-row hover:bg-white/[.015]">
+          <td class="whitespace-nowrap px-5 py-4"><div class="font-medium text-white">${s.symbol.replace("USDT", "")}<span class="ml-1 text-slate-500">/ USDT</span></div><div class="mt-1 text-[10px] muted">${s.interval}m · ${time}</div></td>
+          <td class="px-4 py-4"><span class="font-semibold ${sideClass}">${sideLabel}</span></td>
+          <td class="mono whitespace-nowrap px-4 py-4 text-slate-200">${formatPrice(s.entry)}</td>
+          <td class="mono whitespace-nowrap px-4 py-4 ${s.breakeven ? "text-sky-300" : "text-rose-300"}">${formatPrice(s.stop_loss)}${s.breakeven ? " BE" : ""}</td>
+          <td class="mono whitespace-nowrap px-4 py-4">${targets[0]}</td><td class="mono whitespace-nowrap px-4 py-4">${targets[1]}</td><td class="mono whitespace-nowrap px-4 py-4">${targets[2]}</td>
+          <td class="whitespace-nowrap px-4 py-4"><div class="mono mb-1 text-slate-300">RSI ${Number(s.rsi).toFixed(1)}</div><div class="mono mb-2 text-[10px] muted">EMA ${formatPrice(s.ema50)} / ${formatPrice(s.ema200)}</div>${statusMarkup(s)}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    function handleMessage(message) {
+      if (message.type === "snapshot") {
+        Object.entries(message.prices || {}).forEach(([symbol, price]) => updatePrice(symbol, price));
+        (message.signals || []).forEach((signal) => signals.set(signal.id, signal));
+        renderSignals();
+      } else if (message.type === "ticker") {
+        updatePrice(message.symbol, message.price);
+      } else if (message.type === "signal" || message.type === "signal_update") {
+        const isNew = message.type === "signal";
+        signals.set(message.signal.id, message.signal);
+        renderSignals();
+        if (isNew) notifySound();
+      }
+      byId("last-update").textContent = `Обновлено ${new Date().toLocaleTimeString("ru-RU")}`;
+    }
+
+    function updatePrice(symbol, price) {
+      const element = byId(`price-${symbol}`);
+      if (!element) return;
+      const previous = Number(element.dataset.price || price);
+      element.textContent = formatPrice(price);
+      element.classList.remove("up", "down");
+      if (Number(price) > previous) element.classList.add("up");
+      else if (Number(price) < previous) element.classList.add("down");
+      element.dataset.price = price;
+    }
+
+    function connect() {
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      socket = new WebSocket(`${protocol}//${location.host}/ws`);
+      socket.onopen = () => setConnection(true, "Подключено");
+      socket.onmessage = (event) => {
+        try { handleMessage(JSON.parse(event.data)); }
+        catch (error) { console.error("Ошибка обработки сообщения:", error); }
+      };
+      socket.onerror = (error) => console.error("Ошибка WebSocket:", error);
+      socket.onclose = () => {
+        setConnection(false, "Переподключение...");
+        window.setTimeout(connect, 2000);
+      };
+    }
+
+    byId("sound-toggle").addEventListener("click", async () => {
+      audioEnabled = !audioEnabled;
+      byId("sound-toggle").textContent = `Звук: ${audioEnabled ? "вкл." : "выкл."}`;
+      byId("sound-toggle").setAttribute("aria-pressed", String(audioEnabled));
+      if (audioEnabled) {
+        audioContext ||= new (window.AudioContext || window.webkitAudioContext)();
+        if (audioContext.state === "suspended") await audioContext.resume();
+      }
+    });
+    connect();
+  </script>
+</body>
+</html>
