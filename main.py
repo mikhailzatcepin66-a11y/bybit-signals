@@ -30,6 +30,7 @@ logger = logging.getLogger("bybit-signals")
 SYMBOLS = (
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
     "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "LTCUSDT",
+    "DOTUSDT", "SUIUSDT",
 )
 INTERVALS = (strategy.TIMEFRAME,)
 HISTORY_LIMIT = 300
@@ -138,9 +139,10 @@ class SignalEngine:
             }
         )
         setup = strategy.pullback_signal(frame)
-        if setup is None:
-            return
         current = candles[-1]
+        if setup is None:
+            self._maybe_watch(symbol, interval, current, frame)
+            return
         key = f"{symbol}:{interval}:{current.start}"
         if any(signal["candle_key"] == key for signal in self.signals):
             return
@@ -176,6 +178,19 @@ class SignalEngine:
         del self.signals[100:]
         self._broadcast({"type": "signal", "signal": signal})
         logger.info("Generated %s signal for %s (%sm)", setup["side"], symbol, interval)
+
+    def _maybe_watch(self, symbol: str, interval: int, current: Candle, frame: pd.DataFrame) -> None:
+        watch = strategy.watch_signal(frame)
+        if watch is None:
+            return
+        if any(s["symbol"] == symbol and s["status"] == "ACTIVE" for s in self.signals):
+            return
+        daily = fetch_daily_closes(symbol, current.start // DAY_MS * DAY_MS)
+        if daily is not None and not strategy.daily_trend_ok(watch["side"], daily):
+            return
+        watch.update(symbol=symbol, interval=interval, candle=current.start)
+        self._broadcast({"type": "watch", "watch": watch})
+        logger.info("Watch %s %s", watch["side"], symbol)
 
     def _process_ticker(self, message: dict[str, Any]) -> None:
         try:

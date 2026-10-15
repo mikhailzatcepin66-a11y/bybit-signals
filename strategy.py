@@ -64,3 +64,26 @@ def pullback_signal(frame: pd.DataFrame) -> dict[str, Any] | None:
         "ema50": float(ema50.iloc[-1]),
         "ema200": float(ema200.iloc[-1]),
     }
+
+
+WATCH_LONG = 40
+WATCH_SHORT = 60
+
+
+def watch_signal(frame: pd.DataFrame) -> dict[str, Any] | None:
+    """Предупреждение: цена в тренде, RSI только что вошёл в зону перед сигналом."""
+    if len(frame) < MIN_CANDLES:
+        return None
+    close = frame["close"]
+    ema50 = ta.ema(close, length=50).iloc[-1]
+    ema200 = ta.ema(close, length=200).iloc[-1]
+    rsi = ta.rsi(close, length=14)
+    now, prev = rsi.iloc[-1], rsi.iloc[-2]
+    if any(pd.isna(v) for v in (ema50, ema200, now, prev)):
+        return None
+    price = float(close.iloc[-1])
+    if price > ema200 and ema50 > ema200 and prev >= WATCH_LONG > now:
+        return {"side": "LONG", "price": price, "rsi": float(now), "trigger": RSI_LOW}
+    if price < ema200 and ema50 < ema200 and prev <= WATCH_SHORT < now:
+        return {"side": "SHORT", "price": price, "rsi": float(now), "trigger": RSI_HIGH}
+    return None

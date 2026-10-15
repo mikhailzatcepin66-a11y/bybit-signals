@@ -39,7 +39,7 @@ DEFAULT_DEPOSIT = 20.0
 DEFAULT_RISK_PCT = 1.0
 FEE_RATE = 0.00055
 WIN_RATE = 60
-PREF_DEFAULTS = {"tz": 3, "quiet_start": -1, "quiet_end": -1, "loss_limit": 2.0, "week_limit": 4.0}
+PREF_DEFAULTS = {"tz": 3, "quiet_start": -1, "quiet_end": -1, "loss_limit": 2.0, "week_limit": 4.0, "watch": 1}
 BACKUP_DIR = BASE_DIR / "backups"
 BACKUP_KEEP = 7
 REPORT_HOUR = 21
@@ -78,6 +78,7 @@ class Store:
                 ("quiet_end", "INTEGER NOT NULL DEFAULT -1"),
                 ("loss_limit", "REAL NOT NULL DEFAULT 2.0"),
                 ("week_limit", "REAL NOT NULL DEFAULT 4.0"),
+                ("watch", "INTEGER NOT NULL DEFAULT 1"),
             ):
                 try:
                     db.execute(f"ALTER TABLE settings ADD COLUMN {column} {definition}")
@@ -160,12 +161,12 @@ class Store:
     def get_prefs(self, chat_id: int) -> dict[str, Any]:
         with self._connect() as db:
             row = db.execute(
-                "SELECT tz, quiet_start, quiet_end, loss_limit, week_limit FROM settings WHERE chat_id = ?", (chat_id,)
+                "SELECT tz, quiet_start, quiet_end, loss_limit, week_limit, watch FROM settings WHERE chat_id = ?", (chat_id,)
             ).fetchone()
         if not row:
             return dict(PREF_DEFAULTS)
         return {"tz": int(row[0]), "quiet_start": int(row[1]), "quiet_end": int(row[2]),
-                "loss_limit": float(row[3]), "week_limit": float(row[4])}
+                "loss_limit": float(row[3]), "week_limit": float(row[4]), "watch": int(row[5])}
 
     def set_pref(self, chat_id: int, **values: float) -> None:
         if not set(values) <= set(PREF_DEFAULTS):
@@ -604,6 +605,8 @@ async def handle_market_event(bot: Bot, event: dict[str, Any]) -> None:
             return text, trade_keyboard(signal["id"], None)
 
         await notify_subscribers(bot, build, signal["symbol"], photo=photo)
+    elif event["type"] == "watch":
+        await handle_watch(bot, event["watch"])
     elif event["type"] == "signal_update":
         store.record_result(signal)
         text = format_update(signal)
@@ -615,6 +618,30 @@ async def handle_market_event(bot: Bot, event: dict[str, Any]) -> None:
         await notify_subscribers(bot, build, signal["symbol"], signal["id"])
         for chat_id in store.taken_by(signal["id"]):
             await check_discipline(bot, chat_id, signal["id"])
+
+
+async def handle_watch(bot: Bot, watch: dict[str, Any]) -> None:
+    symbol = watch["symbol"]
+    side = watch["side"]
+    zone = "ниже 40" if side == "LONG" else "выше 60"
+    wait = "опустится ниже 35 и вернётся выше" if side == "LONG" else "поднимется выше 65 и вернётся ниже"
+    arrow = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
+    text = (
+        f"👀 <b>Скоро возможен сигнал: {symbol.replace('USDT', '')}</b>\n{LINE}\n"
+        f"Направление: <b>{arrow}</b> · цена {fmt_price(watch['price'])}\n"
+        f"RSI ушёл {zone} (сейчас {watch['rsi']:.0f}): идёт откат по тренду.\n"
+        f"Сигнал придёт, когда RSI {wait} и свеча 4ч закроется.\n"
+        "<i>Это не сигнал: входить пока не нужно. Можно заранее открыть Bybit и приготовиться.</i>"
+    )
+    for chat_id in store.list_chat_ids():
+        if symbol in store.muted(chat_id) or not store.get_prefs(chat_id)["watch"]:
+            continue
+        try:
+            await bot.send_message(chat_id, text, disable_notification=True)
+        except TelegramForbiddenError:
+            store.unsubscribe(chat_id)
+        except TelegramAPIError:
+            logger.exception("Could not send watch to chat %s", chat_id)
 
 
 QUALITY_WINDOW = 30
@@ -791,11 +818,14 @@ MENU = ReplyKeyboardMarkup(
 )
 
 
+BEST_SMALL = {"XRPUSDT", "DOGEUSDT", "LTCUSDT", "DOTUSDT", "SUIUSDT"}
+
+
 def coins_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     muted = store.muted(chat_id)
     buttons = [
         InlineKeyboardButton(
-            text=f"{'❌' if s in muted else '✅'} {s.removesuffix('USDT')}", callback_data=f"coin:{s}"
+            text=f"{'❌' if s in muted else '✅'} {s.removesuffix('USDT')}{' ⭐' if s in BEST_SMALL else ''}", callback_data=f"coin:{s}"
         )
         for s in SYMBOLS
     ]
@@ -809,7 +839,9 @@ def coins_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 
 COINS_TEXT = (
     "🪙 <b>Монеты для сигналов</b>\n" + LINE + "\n"
-    "✅ — сигналы приходят\n❌ — сигналов не будет\nНажмите на монету, чтобы переключить."
+    "✅ — сигналы приходят\n❌ — сигналов не будет\nНажмите на монету, чтобы переключить.\n\n"
+    "⭐ — лучшие в тесте за 2 года и с малым минимальным объёмом: подходят для депозита от $20. "
+    "У BTC и ETH минимальный объём велик, при $20 их сигналы часто придётся пропускать."
 )
 
 
@@ -851,6 +883,7 @@ def settings_text(chat_id: int) -> str:
         f"🛡 Лимит убытка в день: <b>{limit_line(prefs['loss_limit'])}</b>\n"
         f"🛡 Лимит убытка в неделю: <b>{limit_line(prefs['week_limit'])}</b>\n"
         f"🌙 Тихие часы: <b>{quiet_text}</b>\n"
+        f"👀 Предупреждения «скоро сигнал»: <b>{'вкл' if prefs['watch'] else 'выкл'}</b>\n"
         f"🕒 Часовой пояс: <b>UTC{prefs['tz']:+d}</b>\n" + LINE + "\n"
         "<i>1R — сумма, которую вы теряете при стопе. Достигнут лимит — бот просит не входить в новые сделки.</i>"
     )
@@ -869,10 +902,12 @@ async def noop_callback(query: CallbackQuery) -> None:
     await query.answer()
 
 
-@router.callback_query(F.data.startswith(("lim:", "wlim:", "quiet:")))
+@router.callback_query(F.data.startswith(("lim:", "wlim:", "quiet:", "watch:")))
 async def prefs_callback(query: CallbackQuery) -> None:
     kind, _, raw = (query.data or "").partition(":")
-    if kind == "lim":
+    if kind == "watch":
+        store.set_pref(query.from_user.id, watch=0 if store.get_prefs(query.from_user.id)["watch"] else 1)
+    elif kind == "lim":
         store.set_pref(query.from_user.id, loss_limit=float(raw))
     elif kind == "wlim":
         store.set_pref(query.from_user.id, week_limit=float(raw))
@@ -948,6 +983,9 @@ def settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         title("🛡 Лимит убытка в день"), limits,
         title("🛡 Лимит убытка в неделю"), week_limits,
         title("🌙 Тихие часы (без звука)"), quiet,
+        title("👀 Предупреждения «скоро сигнал»"),
+        [InlineKeyboardButton(
+            text="✅ Включены" if prefs["watch"] else "Выключены", callback_data="watch:toggle")],
     ])
 
 
