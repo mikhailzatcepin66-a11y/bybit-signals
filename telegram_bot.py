@@ -339,7 +339,7 @@ def format_new_signal(signal: dict[str, Any], deposit: float, risk_pct: float, i
     tp_pct = sl_pct * strategy.TP_R
     lines = [
         f"{'🟢' if is_long else '🔴'} <b>{'LONG' if is_long else 'SHORT'} · {coin}/USDT</b> · 4ч",
-        f"🏷 <b>Раздел: ФЬЮЧЕРСЫ (USDT Perpetual)</b> — не спот!",
+        "🏷 <b>Раздел: Фьючерсы → Бессрочные → USDT</b> (не спот!)",
         LINE,
         f"📍 Вход  <code>{fmt_price(signal['entry'])}</code>",
         f"🛑 Стоп  <code>{fmt_price(signal['stop_loss'])}</code>  (−{sl_pct:.2f}%)",
@@ -355,7 +355,7 @@ def format_new_signal(signal: dict[str, Any], deposit: float, risk_pct: float, i
         lines += [
             f"💵 <b>Ваш размер</b> (${deposit:g}, риск {risk_pct:g}%)",
             f"Объём <code>{fmt_qty(plan['qty'], info['step'])}</code> {coin} (≈ ${plan['notional']:.2f}) · "
-            f"плечо {plan['min_leverage']}–{plan['max_leverage']}x, Isolated",
+            f"плечо {plan['min_leverage']}–{plan['max_leverage']}x, маржа «Изолированная»",
             f"❌ Стоп <b>−${plan['loss']:.2f}</b> ({plan['loss_pct']:.1f}%) · ✅ Тейк <b>+${plan['gain']:.2f}</b>",
         ]
         if plan["skip"]:
@@ -366,10 +366,13 @@ def format_new_signal(signal: dict[str, Any], deposit: float, risk_pct: float, i
             lines.append(f"⚠️ Минимальный объём {coin} больше расчётного, риск выше {risk_pct:g}%.")
     lines += [
         LINE,
-        "🛠 <b>Где торговать:</b> Bybit → внизу «Деривативы» (Derivatives) → вкладка «USDT Perpetual» → "
-        f"пара {coin}USDT.",
-        f"Isolated → Market → кнопка {'Buy / Long' if is_long else 'Sell / Short'} → TP/SL по Mark Price. "
-        "На споте этот сигнал не работает.",
+        "🛠 <b>Как открыть сделку в приложении Bybit</b>",
+        f"1. Вверху «Фьючерсы» → «Криптовалюта» → «Бессрочные» → «USDT» → пара <b>{coin}USDT</b>.",
+        "2. Маржа «Изолированная», плечо из диапазона выше.",
+        f"3. Тип ордера «Рыночный», объём как выше, кнопка "
+        f"{'«Купить / Лонг»' if is_long else '«Продать / Шорт»'}.",
+        "4. Включите «Тейк-профит / Стоп-лосс» и впишите цены стопа и тейка.",
+        "5. Больше ничего не нужно: биржа сама закроет сделку.",
         f"📋 Стоп не двигать. Не закрылась за {strategy.MAX_BARS // 6} дней — закрыть вручную. "
         "Не больше 2 сделок сразу.",
         f"<i>📊 В тесте за 2 года ≈{WIN_RATE}% сделок в плюс; прибыль даёт серия сделок.</i>",
@@ -758,7 +761,7 @@ HELP = (
     "ℹ️ <b>Как пользоваться ботом</b>\n"
     + LINE + "\n"
     "1️⃣ Придёт сигнал: график, цены входа, стопа и тейка, объём под ваш депозит.\n"
-    "🏷 Торговать нужно на <b>фьючерсах</b>: Bybit → Деривативы → USDT Perpetual (не спот).\n"
+    "🏷 Торговать нужно на <b>фьючерсах</b>: «Фьючерсы» → «Криптовалюта» → «Бессрочные» → «USDT» (не спот).\n"
     "2️⃣ Открыли сделку на Bybit — нажмите <b>«✅ Я вошёл»</b>. Не открыли — «⏭ Пропустил».\n"
     "3️⃣ Бот сам напишет, чем закончилась сделка, и ведёт вашу статистику.\n\n"
     "<b>📱 Меню</b>\n"
@@ -1211,7 +1214,7 @@ async def calc_command(message: Message, command: CommandObject) -> None:
         return
     info = await instrument(symbol)
     if info is None:
-        await message.answer(f"Не нашёл {symbol} на Bybit (USDT Perpetual). {usage}")
+        await message.answer(f"Не нашёл {symbol} среди бессрочных фьючерсов USDT на Bybit. {usage}")
         return
     deposit, risk_pct = store.get_settings(message.chat.id)
     distance = abs(entry - stop)
@@ -1227,7 +1230,7 @@ async def calc_command(message: Message, command: CommandObject) -> None:
         f"(−{signal['risk_pct']:.2f}%) · 🎯 Тейк 1R <code>{fmt_price(take)}</code>",
         f"💼 Депозит ${deposit:g}, риск {risk_pct:g}%",
         f"Объём <code>{fmt_qty(plan['qty'], info['step'])}</code> {coin} (≈ ${plan['notional']:.2f})",
-        f"Плечо {plan['min_leverage']}–{plan['max_leverage']}x, Isolated",
+        f"Плечо {plan['min_leverage']}–{plan['max_leverage']}x, маржа «Изолированная»",
         f"❌ Стоп <b>−${plan['loss']:.2f}</b> ({plan['loss_pct']:.1f}%) · ✅ Тейк <b>+${plan['gain']:.2f}</b>",
     ]
     if plan["skip"]:
