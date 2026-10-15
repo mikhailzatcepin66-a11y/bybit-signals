@@ -53,6 +53,10 @@ class Store:
                 "chat_id INTEGER PRIMARY KEY, deposit REAL NOT NULL, risk_pct REAL NOT NULL)"
             )
             db.execute(
+                "CREATE TABLE IF NOT EXISTS muted ("
+                "chat_id INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY (chat_id, symbol))"
+            )
+            db.execute(
                 "CREATE TABLE IF NOT EXISTS journal ("
                 "signal_id TEXT PRIMARY KEY, symbol TEXT, side TEXT, status TEXT, "
                 "result_r REAL, risk_pct REAL, closed_at TEXT DEFAULT CURRENT_TIMESTAMP)"
@@ -115,6 +119,34 @@ class Store:
                 "SELECT status, result_r, risk_pct FROM journal ORDER BY closed_at"
             ).fetchall()
         return [(r[0], float(r[1]), float(r[2])) for r in rows]
+
+
+    def muted(self, chat_id: int) -> set[str]:
+        with self._connect() as db:
+            rows = db.execute("SELECT symbol FROM muted WHERE chat_id = ?", (chat_id,)).fetchall()
+        return {r[0] for r in rows}
+
+    def toggle_coin(self, chat_id: int, symbol: str) -> None:
+        with self._connect() as db:
+            cursor = db.execute("DELETE FROM muted WHERE chat_id = ? AND symbol = ?", (chat_id, symbol))
+            if cursor.rowcount == 0:
+                db.execute("INSERT INTO muted (chat_id, symbol) VALUES (?, ?)", (chat_id, symbol))
+
+    def set_all_coins(self, chat_id: int, enabled: bool) -> None:
+        with self._connect() as db:
+            db.execute("DELETE FROM muted WHERE chat_id = ?", (chat_id,))
+            if not enabled:
+                db.executemany(
+                    "INSERT INTO muted (chat_id, symbol) VALUES (?, ?)", [(chat_id, s) for s in SYMBOLS]
+                )
+
+    def recent(self, limit: int = 10) -> list[tuple[str, str, str, float, str]]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT symbol, side, status, result_r, closed_at FROM journal "
+                "ORDER BY closed_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [(r[0], r[1], r[2], float(r[3]), str(r[4])) for r in rows]
 
 
 store = Store(DATABASE_PATH)
@@ -257,8 +289,25 @@ def format_update(signal: dict[str, Any]) -> str:
     )
 
 
-async def notify_subscribers(bot: Bot, build_text: Any) -> None:
+def format_report(signal: dict[str, Any], deposit: float, risk_pct: float) -> str:
+    results = [r for _, r, _ in store.journal()]
+    wins = sum(1 for r in results if r > 0)
+    money = signal["result_r"] * deposit * risk_pct / 100
+    verdict = "✅ Успешно" if signal["result_r"] > 0 else "❌ Неудачно"
+    total_money = sum(results) * deposit * risk_pct / 100
+    return (
+        "<b>📑 Отчёт по сигналу</b>\n"
+        f"{verdict}: {signal['side']} {signal['symbol'].removesuffix('USDT')} · "
+        f"{signal['result_r']:+.2f}R ≈ <b>{money:+.2f}$</b> (депозит ${deposit:g}, риск {risk_pct:g}%)\n"
+        f"<b>Всего закрыто:</b> {len(results)} · в плюс {wins} ({wins / len(results) * 100:.0f}%) · "
+        f"итог {sum(results):+.1f}R ≈ {total_money:+.2f}$"
+    )
+
+
+async def notify_subscribers(bot: Bot, build_text: Any, symbol: str | None = None) -> None:
     for chat_id in store.list_chat_ids():
+        if symbol and symbol in store.muted(chat_id):
+            continue
         try:
             await bot.send_message(chat_id, await build_text(chat_id))
         except TelegramForbiddenError:
@@ -277,15 +326,16 @@ async def handle_market_event(bot: Bot, event: dict[str, Any]) -> None:
             deposit, risk_pct = store.get_settings(chat_id)
             return format_new_signal(signal, deposit, risk_pct, info)
 
-        await notify_subscribers(bot, build)
+        await notify_subscribers(bot, build, signal["symbol"])
     elif event["type"] == "signal_update":
         store.record_result(signal)
         text = format_update(signal)
 
-        async def build(_: int) -> str:
-            return text
+        async def build(chat_id: int) -> str:
+            deposit, risk_pct = store.get_settings(chat_id)
+            return text + "\n\n" + format_report(signal, deposit, risk_pct)
 
-        await notify_subscribers(bot, build)
+        await notify_subscribers(bot, build, signal["symbol"])
 
 
 HELP = (
@@ -294,7 +344,9 @@ HELP = (
     "/status — цены и открытые сигналы\n"
     "/deposit 20 — ваш депозит в $\n"
     "/risk 1 — риск на сделку в % депозита (0.25–2)\n"
-    "/stats — результаты закрытых сигналов\n"
+    "/stats — итоги по закрытым сигналам\n"
+    "/history — последние 10 сигналов с результатом\n"
+    "/coins — выбрать монеты для сигналов\n"
     "/stop — отключить уведомления\n\n"
     "Сигналов в среднем 2–4 в неделю (по свечам 4ч), каждый приходит с готовой инструкцией."
 )
@@ -303,10 +355,50 @@ HELP = (
 MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="📈 Статистика")],
-        [KeyboardButton(text="💰 Депозит и риск"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="💰 Депозит и риск"), KeyboardButton(text="🧾 История")],
+        [KeyboardButton(text="🪙 Монеты"), KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
 )
+
+
+def coins_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    muted = store.muted(chat_id)
+    buttons = [
+        InlineKeyboardButton(
+            text=f"{'❌' if s in muted else '✅'} {s.removesuffix('USDT')}", callback_data=f"coin:{s}"
+        )
+        for s in SYMBOLS
+    ]
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([
+        InlineKeyboardButton(text="Все включить", callback_data="coins:on"),
+        InlineKeyboardButton(text="Все выключить", callback_data="coins:off"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+COINS_TEXT = "<b>Монеты для сигналов</b>\n✅ — присылать, ❌ — не присылать. Нажмите на монету, чтобы переключить."
+
+
+@router.message(F.text == "🪙 Монеты")
+@router.message(Command("coins"))
+async def coins_command(message: Message) -> None:
+    store.subscribe(message.chat.id)
+    await message.answer(COINS_TEXT, reply_markup=coins_keyboard(message.chat.id))
+
+
+@router.callback_query(F.data.startswith(("coin:", "coins:")))
+async def coins_callback(query: CallbackQuery) -> None:
+    kind, _, value = (query.data or "").partition(":")
+    chat_id = query.from_user.id
+    if kind == "coin" and value in SYMBOLS:
+        store.toggle_coin(chat_id, value)
+    elif kind == "coins":
+        store.set_all_coins(chat_id, value == "on")
+    await query.answer()
+    if query.message:
+        await query.message.edit_reply_markup(reply_markup=coins_keyboard(chat_id))
 
 
 def settings_keyboard() -> InlineKeyboardMarkup:
@@ -318,6 +410,11 @@ def settings_keyboard() -> InlineKeyboardMarkup:
 @router.message(F.text == "📊 Статус")
 async def menu_status(message: Message) -> None:
     await status_command(message)
+
+
+@router.message(F.text == "🧾 История")
+async def menu_history(message: Message) -> None:
+    await history_command(message)
 
 
 @router.message(F.text == "📈 Статистика")
@@ -427,6 +524,24 @@ async def stats_command(message: Message) -> None:
         f"Макс. просадка: {drawdown:.1f}R\n"
         "<i>1R = сумма риска на сделку, без учёта комиссий.</i>"
     )
+
+
+STATUS_ICONS = {"COMPLETED": "✅ тейк", "STOPPED": "❌ стоп", "EXPIRED": "⏹ время"}
+
+
+@router.message(Command("history"))
+async def history_command(message: Message) -> None:
+    rows = store.recent(10)
+    if not rows:
+        await message.answer("Закрытых сигналов пока нет.")
+        return
+    lines = ["<b>Последние сигналы</b>"]
+    for symbol, side, status, result, closed_at in rows:
+        lines.append(
+            f"{closed_at[:16]} · {side} {symbol.removesuffix('USDT')} · "
+            f"{STATUS_ICONS.get(status, status)} · {result:+.2f}R"
+        )
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("status"))
