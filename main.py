@@ -16,6 +16,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pybit.unified_trading import HTTP, WebSocket as BybitWebSocket
 
+import strategy
+
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -23,8 +25,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bybit-signals")
 
-SYMBOLS = ("BTCUSDT", "ETHUSDT")
-INTERVALS = (5, 15)
+SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT")
+INTERVALS = (strategy.TIMEFRAME,)
 HISTORY_LIMIT = 300
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -108,8 +110,6 @@ class SignalEngine:
     def _create_signal_if_valid(
         self, symbol: str, interval: int, candles: list[Candle]
     ) -> None:
-        if len(candles) < 210:
-            return
         frame = pd.DataFrame(
             {
                 "open": [c.open for c in candles],
@@ -119,104 +119,39 @@ class SignalEngine:
                 "volume": [c.volume for c in candles],
             }
         )
-        close = frame["close"]
-        ema50 = ta.ema(close, length=50)
-        ema200 = ta.ema(close, length=200)
-        rsi = ta.rsi(close, length=14)
-        macd = ta.macd(close, fast=12, slow=26, signal=9)
-        atr = ta.atr(frame["high"], frame["low"], close, length=14)
-        if macd is None:
+        setup = strategy.pullback_signal(frame)
+        if setup is None:
             return
-
-        macd_line = macd[next(name for name in macd.columns if name.startswith("MACD_"))]
-        macd_signal = macd[next(name for name in macd.columns if name.startswith("MACDs_"))]
-        current_index = len(frame) - 1
-        previous_index = current_index - 1
-        required = (
-            ema50.iloc[current_index],
-            ema200.iloc[current_index],
-            rsi.iloc[current_index],
-            rsi.iloc[previous_index],
-            macd_line.iloc[current_index],
-            macd_line.iloc[previous_index],
-            macd_signal.iloc[current_index],
-            macd_signal.iloc[previous_index],
-            atr.iloc[current_index],
-        )
-        if any(pd.isna(value) for value in required):
-            return
-
         current = candles[-1]
-        prior = candles[-2]
-        cross_up = (
-            macd_line.iloc[previous_index] <= macd_signal.iloc[previous_index]
-            and macd_line.iloc[current_index] > macd_signal.iloc[current_index]
-        )
-        cross_down = (
-            macd_line.iloc[previous_index] >= macd_signal.iloc[previous_index]
-            and macd_line.iloc[current_index] < macd_signal.iloc[current_index]
-        )
-        rising_volume = current.volume > prior.volume
-        rsi_now = float(rsi.iloc[current_index])
-        rsi_before = float(rsi.iloc[previous_index])
-        long_momentum = (rsi_before < 35 <= rsi_now) or (
-            45 <= rsi_now <= 65 and rising_volume
-        )
-        short_momentum = (rsi_before > 65 >= rsi_now) or (
-            35 <= rsi_now <= 55
-        )
-
-        side: str | None = None
-        if current.close > float(ema200.iloc[current_index]) and cross_up and long_momentum:
-            side = "LONG"
-        elif current.close < float(ema200.iloc[current_index]) and cross_down and short_momentum:
-            side = "SHORT"
-        if side is None:
+        key = f"{symbol}:{interval}:{current.start}"
+        if any(signal["candle_key"] == key for signal in self.signals):
+            return
+        if any(
+            s["symbol"] == symbol and s["status"] == "ACTIVE" for s in self.signals
+        ):
             return
 
-        candle_key = f"{symbol}:{interval}:{current.start}"
-        if any(signal["candle_key"] == candle_key for signal in self.signals):
-            return
-
-        entry = current.close
-        volatility_stop = 1.5 * float(atr.iloc[current_index])
-        recent = candles[-11:-1]
-        if side == "LONG":
-            local_extreme = min(c.low for c in recent) if recent else entry - volatility_stop
-            stop = min(entry - volatility_stop, local_extreme)
-            risk = entry - stop
-            targets = [entry + risk * multiple for multiple in (1.5, 2.5, 4.0)]
-        else:
-            local_extreme = max(c.high for c in recent) if recent else entry + volatility_stop
-            stop = max(entry + volatility_stop, local_extreme)
-            risk = stop - entry
-            targets = [entry - risk * multiple for multiple in (1.5, 2.5, 4.0)]
-        if risk <= 0 or not all(pd.notna(value) for value in targets):
-            return
-
+        closes_at = current.start + interval * 60_000
         signal = {
-            "id": candle_key,
-            "candle_key": candle_key,
+            "id": key,
+            "candle_key": key,
             "symbol": symbol,
             "interval": interval,
-            "side": side,
-            "entry": entry,
-            "stop_loss": stop,
-            "original_stop_loss": stop,
-            "take_profits": targets,
-            "rsi": rsi_now,
-            "ema50": float(ema50.iloc[current_index]),
-            "ema200": float(ema200.iloc[current_index]),
-            "atr": float(atr.iloc[current_index]),
+            **setup,
+            "take_profits": [setup["take_profit"]],
+            "original_stop_loss": setup["stop_loss"],
+            "max_entry": setup["entry"] + (1 if setup["side"] == "LONG" else -1) * 0.25 * setup["risk"],
+            "expires_at": closes_at + strategy.MAX_BARS * interval * 60_000,
             "status": "ACTIVE",
             "breakeven": False,
             "hit_targets": [],
+            "result_r": None,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         self.signals.insert(0, signal)
         del self.signals[100:]
         self._broadcast({"type": "signal", "signal": signal})
-        logger.info("Generated %s signal for %s (%sm)", side, symbol, interval)
+        logger.info("Generated %s signal for %s (%sm)", setup["side"], symbol, interval)
 
     def _process_ticker(self, message: dict[str, Any]) -> None:
         try:
@@ -224,35 +159,26 @@ class SignalEngine:
             symbol = data["symbol"]
             price = float(data["lastPrice"])
             self.prices[symbol] = price
-            changed: list[dict[str, Any]] = []
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             for signal in self.signals:
                 if signal["symbol"] != symbol or signal["status"] != "ACTIVE":
                     continue
                 is_long = signal["side"] == "LONG"
-                targets = signal["take_profits"]
-                hit_targets = signal["hit_targets"]
-                previous_hit_count = len(hit_targets)
-                previous_status = signal["status"]
-                previous_stop = signal["stop_loss"]
-                for index, target in enumerate(targets):
-                    reached = price >= target if is_long else price <= target
-                    if reached and index + 1 not in hit_targets:
-                        hit_targets.append(index + 1)
-                        if index == 0 and not signal["breakeven"]:
-                            signal["breakeven"] = True
-                            signal["stop_loss"] = signal["entry"]
-                stopped = price <= signal["stop_loss"] if is_long else price >= signal["stop_loss"]
-                if stopped:
-                    signal["status"] = "STOPPED" if not signal["breakeven"] else "BREAKEVEN"
-                elif len(hit_targets) == 3:
+                risk = signal["risk"]
+                sign = 1 if is_long else -1
+                if (price <= signal["stop_loss"]) if is_long else (price >= signal["stop_loss"]):
+                    signal["status"] = "STOPPED"
+                    signal["result_r"] = -1.0
+                elif (price >= signal["take_profit"]) if is_long else (price <= signal["take_profit"]):
                     signal["status"] = "COMPLETED"
-                if (
-                    len(hit_targets) != previous_hit_count
-                    or signal["status"] != previous_status
-                    or signal["stop_loss"] != previous_stop
-                ):
-                    changed.append(signal)
-            for signal in changed:
+                    signal["hit_targets"] = [1]
+                    signal["result_r"] = strategy.TP_R
+                elif now_ms >= signal["expires_at"]:
+                    signal["status"] = "EXPIRED"
+                    signal["result_r"] = sign * (price - signal["entry"]) / risk
+                else:
+                    continue
+                signal["exit_price"] = price
                 self._broadcast({"type": "signal_update", "signal": signal})
             self._broadcast({"type": "ticker", "symbol": symbol, "price": price})
         except (KeyError, TypeError, ValueError):

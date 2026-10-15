@@ -1,0 +1,52 @@
+"""Стратегия «откат по тренду» на 4h. Параметры подобраны бэктестом (research.py)."""
+from typing import Any
+
+import pandas as pd
+import pandas_ta_classic as ta
+
+TIMEFRAME = 240
+SL_ATR = 2.0
+TP_R = 1.0
+MAX_BARS = 48
+RSI_LOW = 35
+RSI_HIGH = 65
+MIN_CANDLES = 210
+
+
+def pullback_signal(frame: pd.DataFrame) -> dict[str, Any] | None:
+    """frame: закрытые свечи по возрастанию времени, последняя строка — только что закрытая."""
+    if len(frame) < MIN_CANDLES:
+        return None
+    close = frame["close"]
+    ema50 = ta.ema(close, length=50)
+    ema200 = ta.ema(close, length=200)
+    rsi = ta.rsi(close, length=14)
+    atr = ta.atr(frame["high"], frame["low"], close, length=14)
+    values = (ema50.iloc[-1], ema200.iloc[-1], rsi.iloc[-1], rsi.iloc[-2], atr.iloc[-1])
+    if any(pd.isna(v) for v in values):
+        return None
+
+    price = float(close.iloc[-1])
+    up = price > ema200.iloc[-1] and ema50.iloc[-1] > ema200.iloc[-1]
+    down = price < ema200.iloc[-1] and ema50.iloc[-1] < ema200.iloc[-1]
+    if up and rsi.iloc[-2] < RSI_LOW <= rsi.iloc[-1]:
+        side = "LONG"
+    elif down and rsi.iloc[-2] > RSI_HIGH >= rsi.iloc[-1]:
+        side = "SHORT"
+    else:
+        return None
+
+    risk = SL_ATR * float(atr.iloc[-1])
+    sign = 1 if side == "LONG" else -1
+    return {
+        "side": side,
+        "entry": price,
+        "stop_loss": price - sign * risk,
+        "take_profit": price + sign * TP_R * risk,
+        "risk": risk,
+        "risk_pct": risk / price * 100,
+        "rsi": float(rsi.iloc[-1]),
+        "atr": float(atr.iloc[-1]),
+        "ema50": float(ema50.iloc[-1]),
+        "ema200": float(ema200.iloc[-1]),
+    }
