@@ -705,7 +705,7 @@ def settings_text(chat_id: int) -> str:
 async def refresh_settings(query: CallbackQuery) -> None:
     if query.message:
         try:
-            await query.message.edit_text(settings_text(query.from_user.id), reply_markup=settings_keyboard())
+            await query.message.edit_text(settings_text(query.from_user.id), reply_markup=settings_keyboard(query.from_user.id))
         except TelegramAPIError:
             pass
 
@@ -715,8 +715,11 @@ async def prefs_callback(query: CallbackQuery) -> None:
     kind, _, raw = (query.data or "").partition(":")
     if kind == "lim":
         store.set_pref(query.from_user.id, loss_limit=float(raw))
-    elif raw == "off":
-        store.set_pref(query.from_user.id, quiet_start=-1, quiet_end=-1)
+    elif raw == "toggle":
+        if store.get_prefs(query.from_user.id)["quiet_start"] >= 0:
+            store.set_pref(query.from_user.id, quiet_start=-1, quiet_end=-1)
+        else:
+            store.set_pref(query.from_user.id, quiet_start=23, quiet_end=7)
     else:
         start, end = (int(x) for x in raw.split("-"))
         store.set_pref(query.from_user.id, quiet_start=start, quiet_end=end)
@@ -737,16 +740,36 @@ async def trade_callback(query: CallbackQuery) -> None:
             pass
 
 
-def settings_keyboard() -> InlineKeyboardMarkup:
-    deposits = [InlineKeyboardButton(text=f"${v}", callback_data=f"dep:{v}") for v in (20, 50, 100, 500)]
-    risks = [InlineKeyboardButton(text=f"{v}%", callback_data=f"risk:{v}") for v in (0.5, 1, 1.5, 2)]
+def settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    deposit, risk_pct = store.get_settings(chat_id)
+    prefs = store.get_prefs(chat_id)
+
+    def mark(active: bool, text: str) -> str:
+        return f"✔ {text}" if active else text
+
+    deposits = [
+        InlineKeyboardButton(text=mark(deposit == v, f"${v}"), callback_data=f"dep:{v}")
+        for v in (20, 50, 100, 500)
+    ]
+    risks = [
+        InlineKeyboardButton(text=mark(risk_pct == v, f"{v}%"), callback_data=f"risk:{v}")
+        for v in (0.5, 1, 1.5, 2)
+    ]
     limits = [
-        InlineKeyboardButton(text=("Лимит " if v else "") + (f"{v}R" if v else "Без лимита"), callback_data=f"lim:{v}")
+        InlineKeyboardButton(
+            text=mark(prefs["loss_limit"] == v, f"Лимит {v}R" if v else "Без лимита"),
+            callback_data=f"lim:{v}",
+        )
         for v in (1, 2, 3, 0)
     ]
+    quiet_on = prefs["quiet_start"] >= 0
+    current = (prefs["quiet_start"], prefs["quiet_end"])
     quiet = [
-        InlineKeyboardButton(text=label, callback_data=f"quiet:{value}")
-        for label, value in (("Тихие: выкл", "off"), ("23–07", "23-7"), ("00–08", "0-8"))
+        InlineKeyboardButton(
+            text="🔕 Тихие: вкл" if quiet_on else "🔔 Тихие: выкл", callback_data="quiet:toggle"
+        ),
+        InlineKeyboardButton(text=mark(current == (23, 7), "23–07"), callback_data="quiet:23-7"),
+        InlineKeyboardButton(text=mark(current == (0, 8), "00–08"), callback_data="quiet:0-8"),
     ]
     return InlineKeyboardMarkup(inline_keyboard=[deposits, risks, limits, quiet])
 
@@ -773,7 +796,7 @@ async def menu_help(message: Message) -> None:
 
 @router.message(F.text == "💰 Депозит и риск")
 async def menu_settings(message: Message) -> None:
-    await message.answer(settings_text(message.chat.id), reply_markup=settings_keyboard())
+    await message.answer(settings_text(message.chat.id), reply_markup=settings_keyboard(message.chat.id))
 
 
 @router.callback_query(F.data.startswith(("dep:", "risk:")))
