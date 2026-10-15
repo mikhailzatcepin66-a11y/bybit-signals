@@ -339,6 +339,7 @@ def format_new_signal(signal: dict[str, Any], deposit: float, risk_pct: float, i
     tp_pct = sl_pct * strategy.TP_R
     lines = [
         f"{'🟢' if is_long else '🔴'} <b>{'LONG' if is_long else 'SHORT'} · {coin}/USDT</b> · 4ч",
+        f"🏷 <b>Раздел: ФЬЮЧЕРСЫ (USDT Perpetual)</b> — не спот!",
         LINE,
         f"📍 Вход  <code>{fmt_price(signal['entry'])}</code>",
         f"🛑 Стоп  <code>{fmt_price(signal['stop_loss'])}</code>  (−{sl_pct:.2f}%)",
@@ -365,8 +366,10 @@ def format_new_signal(signal: dict[str, Any], deposit: float, risk_pct: float, i
             lines.append(f"⚠️ Минимальный объём {coin} больше расчётного, риск выше {risk_pct:g}%.")
     lines += [
         LINE,
-        f"🛠 Bybit: USDT Perpetual → Isolated → Market → {'Buy / Long' if is_long else 'Sell / Short'} → "
-        "TP/SL по Mark Price. Больше ничего не нужно.",
+        "🛠 <b>Где торговать:</b> Bybit → внизу «Деривативы» (Derivatives) → вкладка «USDT Perpetual» → "
+        f"пара {coin}USDT.",
+        f"Isolated → Market → кнопка {'Buy / Long' if is_long else 'Sell / Short'} → TP/SL по Mark Price. "
+        "На споте этот сигнал не работает.",
         f"📋 Стоп не двигать. Не закрылась за {strategy.MAX_BARS // 6} дней — закрыть вручную. "
         "Не больше 2 сделок сразу.",
         f"<i>📊 В тесте за 2 года ≈{WIN_RATE}% сделок в плюс; прибыль даёт серия сделок.</i>",
@@ -606,6 +609,45 @@ async def handle_market_event(bot: Bot, event: dict[str, Any]) -> None:
             return text + "\n\n" + format_report(signal, deposit, risk_pct, chat_id)
 
         await notify_subscribers(bot, build, signal["symbol"], signal["id"])
+        for chat_id in store.taken_by(signal["id"]):
+            await check_discipline(bot, chat_id, signal["id"])
+
+
+QUALITY_WINDOW = 30
+
+
+async def check_discipline(bot: Bot, chat_id: int, signal_id: str) -> None:
+    """Серия стопов и сравнение живых результатов с тестом."""
+    results = [r for _, r in store.closed_trades(chat_id)]
+    streak = 0
+    for r in reversed(results):
+        if r > 0:
+            break
+        streak += 1
+    if streak >= 3 and not store.reminded(chat_id, f"streak:{signal_id}"):
+        store.mark_reminded(chat_id, f"streak:{signal_id}")
+        _, risk_pct = store.get_settings(chat_id)
+        await send_message(
+            bot, chat_id,
+            f"🧊 <b>Серия: {streak} стопа подряд.</b>\n{LINE}\n"
+            f"Такое бывает и в рабочей стратегии. Предлагаю на следующие сделки снизить риск вдвое: "
+            f"с {risk_pct:g}% до {risk_pct / 2:g}% (⚙️ Настройки) и не пытаться отыграться.",
+        )
+    if len(results) >= QUALITY_WINDOW:
+        key = f"quality:{len(results) // 10}"
+        recent = results[-QUALITY_WINDOW:]
+        avg = sum(recent) / len(recent)
+        wins = sum(1 for r in recent if r > 0) / len(recent) * 100
+        if avg < 0 and not store.reminded(chat_id, key):
+            store.mark_reminded(chat_id, key)
+            await send_message(
+                bot, chat_id,
+                f"🔎 <b>Контроль качества</b>\n{LINE}\n"
+                f"Последние {len(recent)} ваших сделок: в плюс {wins:.0f}%, среднее {avg:+.2f}R. "
+                f"В тесте за 2 года было ≈{WIN_RATE}% и около +0.2R.\n"
+                "Результат хуже теста. Не увеличивайте риск; проверьте, что вы входите без опоздания "
+                "и не двигаете стоп. Если так продолжится, торговлю лучше приостановить.",
+            )
 
 
 async def check_feed(bot: Bot) -> None:
@@ -716,6 +758,7 @@ HELP = (
     "ℹ️ <b>Как пользоваться ботом</b>\n"
     + LINE + "\n"
     "1️⃣ Придёт сигнал: график, цены входа, стопа и тейка, объём под ваш депозит.\n"
+    "🏷 Торговать нужно на <b>фьючерсах</b>: Bybit → Деривативы → USDT Perpetual (не спот).\n"
     "2️⃣ Открыли сделку на Bybit — нажмите <b>«✅ Я вошёл»</b>. Не открыли — «⏭ Пропустил».\n"
     "3️⃣ Бот сам напишет, чем закончилась сделка, и ведёт вашу статистику.\n\n"
     "<b>📱 Меню</b>\n"
@@ -726,7 +769,8 @@ HELP = (
     "⚙️ Настройки — депозит, риск, лимиты, тихие часы\n\n"
     "<b>⌨️ Команды</b>\n"
     "/deposit 20 · /risk 1 · /limit 2 · /weeklimit 4\n"
-    "/quiet 23 7 (тихие часы), /quiet off · /tz 3 · /report · /week · /stop\n\n"
+    "/quiet 23 7 (тихие часы), /quiet off · /tz 3 · /report · /week · /stop\n"
+    "/calc SOL 100 95 — калькулятор объёма: монета, вход, стоп\n\n"
     f"🪙 Монеты: {', '.join(s.removesuffix('USDT') for s in SYMBOLS)}\n"
     "📅 Сигналов в среднем 2–4 в неделю, стратегия «откат по тренду» на 4ч.\n"
     "🕘 Отчёт дня приходит в 21:00, итоги недели — в воскресенье."
@@ -1152,6 +1196,45 @@ def dashboard_text(chat_id: int) -> str:
 DASH_KEYBOARD = InlineKeyboardMarkup(
     inline_keyboard=[[InlineKeyboardButton(text="🔄 Обновить", callback_data="dash")]]
 )
+
+
+@router.message(Command("calc"))
+async def calc_command(message: Message, command: CommandObject) -> None:
+    usage = "Пример: /calc SOL 100 95 — монета, цена входа, цена стопа. Для шорта стоп выше входа."
+    parts = (command.args or "").split()
+    try:
+        symbol = parts[0].upper().removesuffix("USDT") + "USDT"
+        entry, stop = float(parts[1].replace(",", ".")), float(parts[2].replace(",", "."))
+        assert entry > 0 and stop > 0 and entry != stop
+    except (IndexError, ValueError, AssertionError):
+        await message.answer(usage)
+        return
+    info = await instrument(symbol)
+    if info is None:
+        await message.answer(f"Не нашёл {symbol} на Bybit (USDT Perpetual). {usage}")
+        return
+    deposit, risk_pct = store.get_settings(message.chat.id)
+    distance = abs(entry - stop)
+    is_long = stop < entry
+    signal = {"entry": entry, "risk": distance, "risk_pct": distance / entry * 100}
+    plan = size_position(signal, deposit, risk_pct, info)
+    coin = symbol.removesuffix("USDT")
+    take = entry + distance * strategy.TP_R * (1 if is_long else -1)
+    lines = [
+        f"🧮 <b>Калькулятор · {'LONG' if is_long else 'SHORT'} {coin}/USDT</b>",
+        LINE,
+        f"📍 Вход <code>{fmt_price(entry)}</code> · 🛑 Стоп <code>{fmt_price(stop)}</code> "
+        f"(−{signal['risk_pct']:.2f}%) · 🎯 Тейк 1R <code>{fmt_price(take)}</code>",
+        f"💼 Депозит ${deposit:g}, риск {risk_pct:g}%",
+        f"Объём <code>{fmt_qty(plan['qty'], info['step'])}</code> {coin} (≈ ${plan['notional']:.2f})",
+        f"Плечо {plan['min_leverage']}–{plan['max_leverage']}x, Isolated",
+        f"❌ Стоп <b>−${plan['loss']:.2f}</b> ({plan['loss_pct']:.1f}%) · ✅ Тейк <b>+${plan['gain']:.2f}</b>",
+    ]
+    if plan["skip"]:
+        lines.append("⚠️ Минимальный объём биржи слишком велик для вашего депозита: лучше пропустить.")
+    elif plan["forced"]:
+        lines.append(f"⚠️ Минимальный объём {coin} больше расчётного, риск выше {risk_pct:g}%.")
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("status"))
