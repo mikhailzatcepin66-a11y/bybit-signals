@@ -50,7 +50,7 @@ def signal_chart(candles: list, signal: dict) -> bytes | None:
     ax.set_xlim(-1, n + 9)
     ax.axhspan(min(entry, take), max(entry, take), color=UP, alpha=0.12)
     ax.axhspan(min(entry, stop), max(entry, stop), color=DOWN, alpha=0.12)
-    for price, color, label in ((take, UP, "Take"), (entry, "#38bdf8", "Entry"), (stop, DOWN, "Stop")):
+    for price, color, label in ((take, UP, "Тейк"), (entry, "#38bdf8", "Вход"), (stop, DOWN, "Стоп")):
         ax.hlines(price, -1, n, color=color, linewidth=1.2, linestyle="--")
         ax.text(n + 0.5, price, f" {label} {price:g}", color=color, fontsize=8, va="center")
     low = min(min(c.low for c in candles), stop)
@@ -63,7 +63,7 @@ def signal_chart(candles: list, signal: dict) -> bytes | None:
         [datetime.fromtimestamp(candles[i].start / 1000, timezone.utc).strftime("%d.%m") for i in ticks]
     )
     coin = signal["symbol"].removesuffix("USDT")
-    ax.set_title(f"{signal['side']} {coin}/USDT - 4h", color=TEXT, fontsize=11)
+    ax.set_title(f"{signal['side']} {coin}/USDT · свечи 4ч", color=TEXT, fontsize=11)
     fig.tight_layout()
     return _png(fig)
 
@@ -82,7 +82,7 @@ def equity_chart(results: list[float], title: str) -> bytes | None:
     ax.plot(xs, equity, color=color, linewidth=2)
     ax.fill_between(xs, equity, 0, color=color, alpha=0.15)
     ax.axhline(0, color=TEXT, linewidth=0.8)
-    ax.set_xlabel("trades", color=TEXT, fontsize=8)
+    ax.set_xlabel("сделки", color=TEXT, fontsize=8)
     ax.set_title(f"{title}: {equity[-1]:+.1f}R", color=TEXT, fontsize=11)
     fig.tight_layout()
     return _png(fig)

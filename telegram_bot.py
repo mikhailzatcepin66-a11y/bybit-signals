@@ -543,7 +543,7 @@ def my_equity_png(chat_id: int, days: int | None = None) -> bytes | None:
     tz = store.get_prefs(chat_id)["tz"]
     start = period_start(tz, days) if days else None
     rows = [(dt, r) for dt, r in store.closed_trades(chat_id) if start is None or dt + timedelta(hours=tz) >= start]
-    title = "Your trades" if rows else "Bot signals"
+    title = "Ваши сделки" if rows else "Сигналы бота"
     if not rows:
         rows = store.all_closed()
     return charts.equity_chart([r for _, r in rows], title)
