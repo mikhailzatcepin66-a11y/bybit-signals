@@ -319,15 +319,17 @@ LINE = "━━━━━━━━━━━━━━━"
 
 
 def progress_bar(signal: dict[str, Any], price: float | None) -> str:
-    """Шкала от стопа до тейка с маркером текущей цены."""
+    """Шкала в клетках: зелёные — путь к тейку, красные — путь к стопу."""
     if not price:
         return ""
-    stop, take = signal["stop_loss"], signal["take_profit"]
-    pos = min(max((price - stop) / (take - stop), 0.0), 1.0)
-    cells = ["░"] * 10
-    cells[round(pos * 9)] = "●"
-    r_now = (price - signal["entry"]) / signal["risk"] * (1 if signal["side"] == "LONG" else -1)
-    return f"🛑 {''.join(cells)} 🎯  <b>{r_now:+.2f}R</b>"
+    sign = 1 if signal["side"] == "LONG" else -1
+    r_now = (price - signal["entry"]) / signal["risk"] * sign
+    filled = min(round(abs(r_now) * 10), 10)
+    if r_now >= 0:
+        bar = "🟩" * filled + "⬜" * (10 - filled)
+        return f"{bar}\n📈 В плюсе <b>{r_now:+.2f}R</b> · до тейка ещё {max(strategy.TP_R - r_now, 0):.2f}R"
+    bar = "🟥" * filled + "⬜" * (10 - filled)
+    return f"{bar}\n📉 В минусе <b>{r_now:+.2f}R</b> · до стопа ещё {max(1 + r_now, 0):.2f}R"
 
 
 def format_new_signal(signal: dict[str, Any], deposit: float, risk_pct: float, info: dict[str, float] | None) -> str:
@@ -711,23 +713,23 @@ async def background_loop(bot: Bot) -> None:
 
 
 HELP = (
-    "<b>Бот сигналов Bybit</b> (стратегия «откат по тренду», 4h)\n"
-    f"Монеты: {', '.join(s.removesuffix('USDT') for s in SYMBOLS)}\n\n"
-    "/status — цены, открытые сигналы, состояние бота\n"
-    "/stats — итоги по закрытым сигналам\n"
-    "/history — последние 10 сигналов\n"
-    "/report — итоги дня, /week — итоги недели\n"
-    "/coins — выбрать монеты\n"
-    "/deposit 20 — депозит в $\n"
-    "/risk 1 — риск на сделку, % депозита (0.25–2)\n"
-    "/limit 2 — дневной лимит убытка в R (0 — выключить)\n"
-    "/weeklimit 4 — недельный лимит убытка в R (пауза до понедельника)\n"
-    "/quiet 23 7 — тихие часы (без звука), /quiet off — выключить\n"
-    "/tz 3 — ваш часовой пояс (UTC+3 — Москва)\n"
-    "/stop — отключить уведомления\n\n"
-    "Сигналов в среднем 2–4 в неделю. Под каждым сигналом кнопки «Я вошёл» / «Пропустил» — "
-    "по ним бот ведёт вашу личную статистику, напоминает об открытых сделках и присылает отчёты "
-    "каждый день в 21:00 и в воскресенье итоги недели."
+    "ℹ️ <b>Как пользоваться ботом</b>\n"
+    + LINE + "\n"
+    "1️⃣ Придёт сигнал: график, цены входа, стопа и тейка, объём под ваш депозит.\n"
+    "2️⃣ Открыли сделку на Bybit — нажмите <b>«✅ Я вошёл»</b>. Не открыли — «⏭ Пропустил».\n"
+    "3️⃣ Бот сам напишет, чем закончилась сделка, и ведёт вашу статистику.\n\n"
+    "<b>📱 Меню</b>\n"
+    "📊 Дашборд — цены, открытые сделки, итоги дня и недели\n"
+    "📈 Отчёты — статистика и график результатов\n"
+    "🧾 История — последние сигналы\n"
+    "🪙 Монеты — по каким монетам получать сигналы\n"
+    "⚙️ Настройки — депозит, риск, лимиты, тихие часы\n\n"
+    "<b>⌨️ Команды</b>\n"
+    "/deposit 20 · /risk 1 · /limit 2 · /weeklimit 4\n"
+    "/quiet 23 7 (тихие часы), /quiet off · /tz 3 · /report · /week · /stop\n\n"
+    f"🪙 Монеты: {', '.join(s.removesuffix('USDT') for s in SYMBOLS)}\n"
+    "📅 Сигналов в среднем 2–4 в неделю, стратегия «откат по тренду» на 4ч.\n"
+    "🕘 Отчёт дня приходит в 21:00, итоги недели — в воскресенье."
 )
 
 
@@ -757,7 +759,10 @@ def coins_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-COINS_TEXT = "<b>Монеты для сигналов</b>\n✅ — присылать, ❌ — не присылать. Нажмите на монету, чтобы переключить."
+COINS_TEXT = (
+    "🪙 <b>Монеты для сигналов</b>\n" + LINE + "\n"
+    "✅ — сигналы приходят\n❌ — сигналов не будет\nНажмите на монету, чтобы переключить."
+)
 
 
 @router.message(F.text == "🪙 Монеты")
@@ -783,23 +788,23 @@ async def coins_callback(query: CallbackQuery) -> None:
 def settings_text(chat_id: int) -> str:
     deposit, risk_pct = store.get_settings(chat_id)
     prefs = store.get_prefs(chat_id)
-    limit = prefs["loss_limit"]
-    limit_text = f"{limit:g}R (≈ ${limit * deposit * risk_pct / 100:.2f})" if limit > 0 else "выключен"
-    week = prefs["week_limit"]
-    week_text = f"{week:g}R (≈ ${week * deposit * risk_pct / 100:.2f})" if week > 0 else "выключен"
+    unit = deposit * risk_pct / 100
+
+    def limit_line(value: float) -> str:
+        return f"{value:g}R ≈ ${value * unit:.2f}" if value > 0 else "выключен"
+
     quiet_text = (
         f"{prefs['quiet_start']:02d}:00–{prefs['quiet_end']:02d}:00" if prefs["quiet_start"] >= 0 else "выключены"
     )
     return (
-        "<b>Настройки</b>\n"
-        f"Депозит: <b>${deposit:g}</b>\n"
-        f"Риск на сделку: <b>{risk_pct:g}%</b>\n"
-        f"Дневной лимит убытка: <b>{limit_text}</b>\n"
-        f"Недельный лимит убытка: <b>{week_text}</b>\n"
-        f"Тихие часы: <b>{quiet_text}</b> (сообщения приходят без звука)\n"
-        f"Часовой пояс: <b>UTC{prefs['tz']:+d}</b>\n\n"
-        "Ряды кнопок: депозит, риск, дневной лимит, недельный лимит, тихие часы.\n"
-        "Команды: /deposit 75 · /risk 1 · /limit 2 · /weeklimit 4 · /quiet 23 7 · /tz 3"
+        "⚙️ <b>Настройки</b>\n" + LINE + "\n"
+        f"💼 Депозит: <b>${deposit:g}</b>\n"
+        f"🎯 Риск на сделку: <b>{risk_pct:g}%</b> ≈ ${unit:.2f}\n"
+        f"🛡 Лимит убытка в день: <b>{limit_line(prefs['loss_limit'])}</b>\n"
+        f"🛡 Лимит убытка в неделю: <b>{limit_line(prefs['week_limit'])}</b>\n"
+        f"🌙 Тихие часы: <b>{quiet_text}</b>\n"
+        f"🕒 Часовой пояс: <b>UTC{prefs['tz']:+d}</b>\n" + LINE + "\n"
+        "<i>1R — сумма, которую вы теряете при стопе. Достигнут лимит — бот просит не входить в новые сделки.</i>"
     )
 
 
@@ -809,6 +814,11 @@ async def refresh_settings(query: CallbackQuery) -> None:
             await query.message.edit_text(settings_text(query.from_user.id), reply_markup=settings_keyboard(query.from_user.id))
         except TelegramAPIError:
             pass
+
+
+@router.callback_query(F.data == "noop")
+async def noop_callback(query: CallbackQuery) -> None:
+    await query.answer()
 
 
 @router.callback_query(F.data.startswith(("lim:", "wlim:", "quiet:")))
@@ -848,7 +858,10 @@ def settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     prefs = store.get_prefs(chat_id)
 
     def mark(active: bool, text: str) -> str:
-        return f"✔ {text}" if active else text
+        return f"✅ {text}" if active else text
+
+    def title(text: str) -> list[InlineKeyboardButton]:
+        return [InlineKeyboardButton(text=text, callback_data="noop")]
 
     deposits = [
         InlineKeyboardButton(text=mark(deposit == v, f"${v}"), callback_data=f"dep:{v}")
@@ -860,14 +873,14 @@ def settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     ]
     limits = [
         InlineKeyboardButton(
-            text=mark(prefs["loss_limit"] == v, f"Лимит {v}R" if v else "Без лимита"),
+            text=mark(prefs["loss_limit"] == v, f"{v}R" if v else "Выкл"),
             callback_data=f"lim:{v}",
         )
         for v in (1, 2, 3, 0)
     ]
     week_limits = [
         InlineKeyboardButton(
-            text=mark(prefs["week_limit"] == v, f"Неделя {v}R" if v else "Без недельного"),
+            text=mark(prefs["week_limit"] == v, f"{v}R" if v else "Выкл"),
             callback_data=f"wlim:{v}",
         )
         for v in (3, 4, 6, 0)
@@ -876,12 +889,18 @@ def settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     current = (prefs["quiet_start"], prefs["quiet_end"])
     quiet = [
         InlineKeyboardButton(
-            text="🔕 Тихие: вкл" if quiet_on else "🔔 Тихие: выкл", callback_data="quiet:toggle"
+            text="🔕 Включены" if quiet_on else "🔔 Выключены", callback_data="quiet:toggle"
         ),
-        InlineKeyboardButton(text=mark(current == (23, 7), "23–07"), callback_data="quiet:23-7"),
-        InlineKeyboardButton(text=mark(current == (0, 8), "00–08"), callback_data="quiet:0-8"),
+        InlineKeyboardButton(text=mark(quiet_on and current == (23, 7), "23–07"), callback_data="quiet:23-7"),
+        InlineKeyboardButton(text=mark(quiet_on and current == (0, 8), "00–08"), callback_data="quiet:0-8"),
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[deposits, risks, limits, week_limits, quiet])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        title("💼 Депозит"), deposits,
+        title("🎯 Риск на сделку"), risks,
+        title("🛡 Лимит убытка в день"), limits,
+        title("🛡 Лимит убытка в неделю"), week_limits,
+        title("🌙 Тихие часы (без звука)"), quiet,
+    ])
 
 
 @router.message(F.text.in_({"📊 Статус", "📊 Дашборд"}))
@@ -1031,10 +1050,10 @@ async def week_command(message: Message) -> None:
 def personal_stats(chat_id: int) -> str:
     mine = my_results(chat_id)
     if not mine:
-        return "\n\n<i>Ваших отмеченных сделок пока нет — нажимайте «Я вошёл» под сигналом.</i>"
+        return "\n\n<i>Ваших отмеченных сделок пока нет — нажимайте «✅ Я вошёл» под сигналом.</i>"
     return (
-        f"\n\n<b>Ваши сделки («Я вошёл»):</b> {len(mine)} · в плюс {sum(1 for r in mine if r > 0)} · "
-        f"итог {sum(mine):+.1f}R"
+        f"\n{LINE}\n👤 <b>Ваши сделки</b>: {len(mine)} · в плюс {sum(1 for r in mine if r > 0)}\n"
+        f"Итог: <b>{money(chat_id, mine)}</b>"
     )
 
 
@@ -1052,32 +1071,36 @@ async def stats_command(message: Message) -> None:
         equity += r
         peak = max(peak, equity)
         drawdown = max(drawdown, peak - equity)
+    deposit, risk_pct = store.get_settings(message.chat.id)
     await message.answer(
-        f"<b>Закрытых сигналов:</b> {len(results)}\n"
-        f"В плюс: {wins} ({wins / len(results) * 100:.0f}%)\n"
-        f"Сумма: {total:+.1f}R · среднее {total / len(results):+.2f}R\n"
+        "📈 <b>Отчёт по сигналам бота</b>\n" + LINE + "\n"
+        f"Закрыто: <b>{len(results)}</b> · ✅ {wins} · ❌ {len(results) - wins} "
+        f"(в плюс {wins / len(results) * 100:.0f}%)\n"
+        f"Сумма: <b>{total:+.1f}R</b> · среднее на сделку {total / len(results):+.2f}R\n"
         f"Макс. просадка: {drawdown:.1f}R\n"
-        "<i>1R = сумма риска на сделку, без учёта комиссий.</i>"
+        "<i>1R = сумма риска на сделку, комиссии не учтены.</i>"
         + personal_stats(message.chat.id)
     )
     await send_equity(message.bot, message.chat.id)
 
 
-STATUS_ICONS = {"COMPLETED": "✅ тейк", "STOPPED": "❌ стоп", "EXPIRED": "⏹ время"}
+STATUS_ICONS = {"COMPLETED": "✅ Тейк", "STOPPED": "❌ Стоп", "EXPIRED": "⏹ По времени"}
 
 
 @router.message(Command("history"))
 async def history_command(message: Message) -> None:
     rows = store.recent(10)
     if not rows:
-        await message.answer("Закрытых сигналов пока нет.")
+        await message.answer("🧾 Закрытых сигналов пока нет.")
         return
-    lines = ["<b>Последние сигналы</b>"]
+    lines = ["🧾 <b>Последние сигналы</b>", LINE]
     for symbol, side, status, result, closed_at in rows:
         lines.append(
-            f"{closed_at[:16]} · {side} {symbol.removesuffix('USDT')} · "
-            f"{STATUS_ICONS.get(status, status)} · {result:+.2f}R"
+            f"{'🟢' if side == 'LONG' else '🔴'} <b>{symbol.removesuffix('USDT')}</b> {side} · "
+            f"{STATUS_ICONS.get(status, status)} · <b>{result:+.2f}R</b>\n<i>{closed_at[:16]}</i>"
         )
+    total = sum(r[3] for r in rows)
+    lines += [LINE, f"Итого за последние {len(rows)}: <b>{total:+.1f}R</b>"]
     await message.answer("\n".join(lines))
 
 
