@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -16,6 +17,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pybit.unified_trading import HTTP, WebSocket as BybitWebSocket
 
+import news
 import strategy
 
 
@@ -32,6 +34,19 @@ SYMBOLS = (
 INTERVALS = (strategy.TIMEFRAME,)
 HISTORY_LIMIT = 300
 STATIC_DIR = Path(__file__).parent / "static"
+STATE_PATH = Path(__file__).parent / "signals_state.json"
+DAY_MS = 86_400_000
+
+
+def fetch_daily_closes(symbol: str, before_ms: int) -> list[float] | None:
+    """Закрытия полных дневных свечей (UTC) строго до before_ms, по возрастанию времени."""
+    try:
+        response = HTTP(testnet=False).get_kline(category="linear", symbol=symbol, interval="D", limit=120)
+        rows = [r for r in response["result"]["list"] if int(r[0]) < before_ms]
+        return [float(r[4]) for r in reversed(rows)]
+    except Exception:
+        logger.exception("Could not load daily candles for %s", symbol)
+        return None
 
 
 @dataclass
@@ -134,6 +149,11 @@ class SignalEngine:
         ):
             return
 
+        daily = fetch_daily_closes(symbol, current.start // DAY_MS * DAY_MS)
+        if daily is not None and not strategy.daily_trend_ok(setup["side"], daily):
+            logger.info("Skipped %s %s signal: against the daily trend", setup["side"], symbol)
+            return
+
         closes_at = current.start + interval * 60_000
         signal = {
             "id": key,
@@ -150,6 +170,7 @@ class SignalEngine:
             "hit_targets": [],
             "result_r": None,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "news": news.upcoming_event(),
         }
         self.signals.insert(0, signal)
         del self.signals[100:]
@@ -187,7 +208,29 @@ class SignalEngine:
         except (KeyError, TypeError, ValueError):
             logger.exception("Could not process Bybit ticker message: %r", message)
 
+    def save_state(self) -> None:
+        try:
+            tmp = STATE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.signals, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(STATE_PATH)
+        except OSError:
+            logger.exception("Could not save signals state")
+
+    def load_state(self) -> int:
+        """Восстанавливает сигналы после перезапуска; возвращает число открытых."""
+        try:
+            saved = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return 0
+        except (OSError, ValueError):
+            logger.exception("Could not read signals state")
+            return 0
+        self.signals = [s for s in saved if isinstance(s, dict) and "id" in s][:100]
+        return sum(1 for s in self.signals if s.get("status") == "ACTIVE")
+
     def _broadcast(self, message: dict[str, Any]) -> None:
+        if message.get("type") in ("signal", "signal_update"):
+            self.save_state()
         if self.loop is not None:
             if self.event_handler is not None:
                 asyncio.create_task(self.event_handler(message))
@@ -231,6 +274,9 @@ def _start_bybit_streams() -> list[BybitWebSocket]:
 
 async def start_market_data() -> None:
     engine.loop = asyncio.get_running_loop()
+    restored = engine.load_state()
+    if restored:
+        logger.info("Restored %s active signals after restart", restored)
     http = HTTP(testnet=False)
     for symbol in SYMBOLS:
         for interval in INTERVALS:

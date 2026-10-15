@@ -2,6 +2,7 @@ import asyncio
 import logging
 import math
 import os
+import shutil
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -36,7 +37,9 @@ DEFAULT_DEPOSIT = 20.0
 DEFAULT_RISK_PCT = 1.0
 FEE_RATE = 0.00055
 WIN_RATE = 60
-PREF_DEFAULTS = {"tz": 3, "quiet_start": -1, "quiet_end": -1, "loss_limit": 2.0}
+PREF_DEFAULTS = {"tz": 3, "quiet_start": -1, "quiet_end": -1, "loss_limit": 2.0, "week_limit": 4.0}
+BACKUP_DIR = BASE_DIR / "backups"
+BACKUP_KEEP = 7
 REPORT_HOUR = 21
 REMIND_AGE_HOURS = 72
 WATCHDOG_SECONDS = 300
@@ -72,6 +75,7 @@ class Store:
                 ("quiet_start", "INTEGER NOT NULL DEFAULT -1"),
                 ("quiet_end", "INTEGER NOT NULL DEFAULT -1"),
                 ("loss_limit", "REAL NOT NULL DEFAULT 2.0"),
+                ("week_limit", "REAL NOT NULL DEFAULT 4.0"),
             ):
                 try:
                     db.execute(f"ALTER TABLE settings ADD COLUMN {column} {definition}")
@@ -154,12 +158,12 @@ class Store:
     def get_prefs(self, chat_id: int) -> dict[str, Any]:
         with self._connect() as db:
             row = db.execute(
-                "SELECT tz, quiet_start, quiet_end, loss_limit FROM settings WHERE chat_id = ?", (chat_id,)
+                "SELECT tz, quiet_start, quiet_end, loss_limit, week_limit FROM settings WHERE chat_id = ?", (chat_id,)
             ).fetchone()
         if not row:
             return dict(PREF_DEFAULTS)
         return {"tz": int(row[0]), "quiet_start": int(row[1]), "quiet_end": int(row[2]),
-                "loss_limit": float(row[3])}
+                "loss_limit": float(row[3]), "week_limit": float(row[4])}
 
     def set_pref(self, chat_id: int, **values: float) -> None:
         if not set(values) <= set(PREF_DEFAULTS):
@@ -406,16 +410,31 @@ def period_start(tz: int, days: int) -> datetime:
     return today - timedelta(days=days - 1)
 
 
-def my_results(chat_id: int, days: int | None = None) -> list[float]:
+def week_start(tz: int) -> datetime:
+    today = local_now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    return today - timedelta(days=today.weekday())
+
+
+def my_results(chat_id: int, days: int | None = None, since: datetime | None = None) -> list[float]:
     prefs = store.get_prefs(chat_id)
     tz = prefs["tz"]
-    start = period_start(tz, days) if days else None
+    start = since or (period_start(tz, days) if days else None)
     return [r for dt, r in store.closed_trades(chat_id) if start is None or dt + timedelta(hours=tz) >= start]
 
 
+def pause_reason(chat_id: int) -> str | None:
+    prefs = store.get_prefs(chat_id)
+    week = prefs["week_limit"]
+    if week > 0 and sum(my_results(chat_id, since=week_start(prefs["tz"]))) <= -week:
+        return "week"
+    day = prefs["loss_limit"]
+    if day > 0 and sum(my_results(chat_id, 1)) <= -day:
+        return "day"
+    return None
+
+
 def is_paused(chat_id: int) -> bool:
-    limit = store.get_prefs(chat_id)["loss_limit"]
-    return limit > 0 and sum(my_results(chat_id, 1)) <= -limit
+    return pause_reason(chat_id) is not None
 
 
 def feed_status() -> str:
@@ -440,10 +459,16 @@ def format_report(signal: dict[str, Any], deposit: float, risk_pct: float, chat_
         f"<b>Всего ваших сделок:</b> {len(results)} · в плюс {wins} ({wins / len(results) * 100:.0f}%) · "
         f"итог {sum(results):+.1f}R ≈ {total_money:+.2f}$"
     )
-    if is_paused(chat_id):
-        limit = store.get_prefs(chat_id)["loss_limit"]
+    reason = pause_reason(chat_id)
+    prefs = store.get_prefs(chat_id)
+    if reason == "week":
         text += (
-            f"\n\n⛔ <b>Дневной лимит убытка ({limit:g}R) достигнут.</b>\n"
+            f"\n\n⛔ <b>Недельный лимит убытка ({prefs['week_limit']:g}R) достигнут.</b>\n"
+            "Пауза до понедельника: не входите в новые сделки, разберите ошибки и вернитесь с чистой головой."
+        )
+    elif reason == "day":
+        text += (
+            f"\n\n⛔ <b>Дневной лимит убытка ({prefs['loss_limit']:g}R) достигнут.</b>\n"
             "На сегодня хватит: не входите в новые сделки и не пытайтесь отыграться. Завтра — с чистого листа."
         )
     return text
@@ -519,8 +544,15 @@ async def handle_market_event(bot: Bot, event: dict[str, Any]) -> None:
         async def build(chat_id: int) -> Any:
             deposit, risk_pct = store.get_settings(chat_id)
             text = format_new_signal(signal, deposit, risk_pct, info)
-            if is_paused(chat_id):
-                return "⛔ <b>Дневной лимит убытка достигнут — этот сигнал пропустите.</b>\n\n" + text
+            if signal.get("news"):
+                text = (
+                    f"📰 <b>Рядом событие: {signal['news']['name']}.</b> Рынок может резко дёрнуться, "
+                    "стоп сработает чаще обычного. Осторожнее: лучше пропустить или взять половину объёма.\n\n"
+                ) + text
+            reason = pause_reason(chat_id)
+            if reason:
+                period = "Недельный" if reason == "week" else "Дневной"
+                return f"⛔ <b>{period} лимит убытка достигнут — этот сигнал пропустите.</b>\n\n" + text
             text += (
                 "\n\n<i>Если войдёте, нажмите «Я вошёл»: сделка попадёт в вашу статистику, "
                 "и бот напомнит о ней.</i>"
@@ -603,9 +635,37 @@ async def send_reports(bot: Bot) -> None:
             await send_message(bot, chat_id, format_period_report(chat_id, 7)[0])
 
 
+def backup_data() -> None:
+    BACKUP_DIR.mkdir(exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    target = BACKUP_DIR / f"subscribers-{stamp}.sqlite3"
+    if target.exists():
+        return
+    source = sqlite3.connect(DATABASE_PATH)
+    try:
+        destination = sqlite3.connect(target)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
+    state = BASE_DIR / "signals_state.json"
+    if state.exists():
+        shutil.copy2(state, BACKUP_DIR / f"signals-{stamp}.json")
+    for pattern in ("subscribers-*.sqlite3", "signals-*.json"):
+        for old in sorted(BACKUP_DIR.glob(pattern))[:-BACKUP_KEEP]:
+            old.unlink(missing_ok=True)
+    logger.info("Backup saved: %s", target.name)
+
+
 async def background_loop(bot: Bot) -> None:
     while True:
         await asyncio.sleep(60)
+        try:
+            await asyncio.to_thread(backup_data)
+        except Exception:
+            logger.exception("Backup failed")
         for step in (check_feed, send_reminders, send_reports):
             try:
                 await step(bot)
@@ -624,6 +684,7 @@ HELP = (
     "/deposit 20 — депозит в $\n"
     "/risk 1 — риск на сделку, % депозита (0.25–2)\n"
     "/limit 2 — дневной лимит убытка в R (0 — выключить)\n"
+    "/weeklimit 4 — недельный лимит убытка в R (пауза до понедельника)\n"
     "/quiet 23 7 — тихие часы (без звука), /quiet off — выключить\n"
     "/tz 3 — ваш часовой пояс (UTC+3 — Москва)\n"
     "/stop — отключить уведомления\n\n"
@@ -687,6 +748,8 @@ def settings_text(chat_id: int) -> str:
     prefs = store.get_prefs(chat_id)
     limit = prefs["loss_limit"]
     limit_text = f"{limit:g}R (≈ ${limit * deposit * risk_pct / 100:.2f})" if limit > 0 else "выключен"
+    week = prefs["week_limit"]
+    week_text = f"{week:g}R (≈ ${week * deposit * risk_pct / 100:.2f})" if week > 0 else "выключен"
     quiet_text = (
         f"{prefs['quiet_start']:02d}:00–{prefs['quiet_end']:02d}:00" if prefs["quiet_start"] >= 0 else "выключены"
     )
@@ -695,10 +758,11 @@ def settings_text(chat_id: int) -> str:
         f"Депозит: <b>${deposit:g}</b>\n"
         f"Риск на сделку: <b>{risk_pct:g}%</b>\n"
         f"Дневной лимит убытка: <b>{limit_text}</b>\n"
+        f"Недельный лимит убытка: <b>{week_text}</b>\n"
         f"Тихие часы: <b>{quiet_text}</b> (сообщения приходят без звука)\n"
         f"Часовой пояс: <b>UTC{prefs['tz']:+d}</b>\n\n"
-        "Ряды кнопок: депозит, риск, лимит убытка, тихие часы.\n"
-        "Команды: /deposit 75 · /risk 1 · /limit 2 · /quiet 23 7 · /tz 3"
+        "Ряды кнопок: депозит, риск, дневной лимит, недельный лимит, тихие часы.\n"
+        "Команды: /deposit 75 · /risk 1 · /limit 2 · /weeklimit 4 · /quiet 23 7 · /tz 3"
     )
 
 
@@ -710,11 +774,13 @@ async def refresh_settings(query: CallbackQuery) -> None:
             pass
 
 
-@router.callback_query(F.data.startswith(("lim:", "quiet:")))
+@router.callback_query(F.data.startswith(("lim:", "wlim:", "quiet:")))
 async def prefs_callback(query: CallbackQuery) -> None:
     kind, _, raw = (query.data or "").partition(":")
     if kind == "lim":
         store.set_pref(query.from_user.id, loss_limit=float(raw))
+    elif kind == "wlim":
+        store.set_pref(query.from_user.id, week_limit=float(raw))
     elif raw == "toggle":
         if store.get_prefs(query.from_user.id)["quiet_start"] >= 0:
             store.set_pref(query.from_user.id, quiet_start=-1, quiet_end=-1)
@@ -762,6 +828,13 @@ def settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         )
         for v in (1, 2, 3, 0)
     ]
+    week_limits = [
+        InlineKeyboardButton(
+            text=mark(prefs["week_limit"] == v, f"Неделя {v}R" if v else "Без недельного"),
+            callback_data=f"wlim:{v}",
+        )
+        for v in (3, 4, 6, 0)
+    ]
     quiet_on = prefs["quiet_start"] >= 0
     current = (prefs["quiet_start"], prefs["quiet_end"])
     quiet = [
@@ -771,7 +844,7 @@ def settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=mark(current == (23, 7), "23–07"), callback_data="quiet:23-7"),
         InlineKeyboardButton(text=mark(current == (0, 8), "00–08"), callback_data="quiet:0-8"),
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[deposits, risks, limits, quiet])
+    return InlineKeyboardMarkup(inline_keyboard=[deposits, risks, limits, week_limits, quiet])
 
 
 @router.message(F.text == "📊 Статус")
@@ -867,6 +940,16 @@ async def limit_command(message: Message, command: CommandObject) -> None:
         await message.answer("Пример: /limit 2 — стоп на день после убытка 2R. /limit 0 — без лимита.")
         return
     store.set_pref(message.chat.id, loss_limit=value)
+    await message.answer(settings_text(message.chat.id))
+
+
+@router.message(Command("weeklimit"))
+async def week_limit_command(message: Message, command: CommandObject) -> None:
+    value = _parse_number(command)
+    if value is None or not 0 <= value <= 50:
+        await message.answer("Пример: /weeklimit 4 — пауза до понедельника после убытка 4R за неделю. 0 — без лимита.")
+        return
+    store.set_pref(message.chat.id, week_limit=value)
     await message.answer(settings_text(message.chat.id))
 
 
@@ -996,12 +1079,17 @@ async def run() -> None:
             LAST["tick"] = time.monotonic()
             background = asyncio.create_task(background_loop(bot))
 
+            open_now = [s for s in engine.signals if s["status"] == "ACTIVE"]
+
             async def started(_: int) -> str:
-                return (
-                    "♻️ <b>Бот запущен</b> и получает данные Bybit.\n"
-                    "Если до перезапуска у вас были открытые сделки, следите за ними по бирже: "
-                    "TP/SL на бирже сработают сами, а бот о них уже не напишет."
-                )
+                text = "♻️ <b>Бот запущен</b> и получает данные Bybit."
+                if open_now:
+                    text += (
+                        f"\nВосстановлено открытых сигналов: {len(open_now)} "
+                        "(" + ", ".join(s["symbol"].removesuffix("USDT") for s in open_now) + "). "
+                        "Слежение за ними продолжается."
+                    )
+                return text
 
             await notify_subscribers(bot, started)
             logger.info("Telegram bot started. Send /start to subscribe.")

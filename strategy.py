@@ -13,6 +13,20 @@ RSI_HIGH = 65
 MIN_CANDLES = 210
 
 
+DAILY_EMA = 50
+
+
+def daily_trend_ok(side: str, daily_closes: list[float]) -> bool:
+    """Сигнал по тренду 4h берём, только если закрытие последнего полного дня по ту же сторону от EMA50 на 1d."""
+    if len(daily_closes) < DAILY_EMA + 10:
+        return True
+    closes = pd.Series(daily_closes, dtype=float)
+    ema = ta.ema(closes, length=DAILY_EMA).iloc[-1]
+    if pd.isna(ema):
+        return True
+    return closes.iloc[-1] > ema if side == "LONG" else closes.iloc[-1] < ema
+
+
 def pullback_signal(frame: pd.DataFrame) -> dict[str, Any] | None:
     """frame: закрытые свечи по возрастанию времени, последняя строка — только что закрытая."""
     if len(frame) < MIN_CANDLES:
