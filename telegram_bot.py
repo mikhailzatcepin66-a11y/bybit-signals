@@ -307,10 +307,11 @@ def size_position(signal: dict[str, Any], deposit: float, risk_pct: float, info:
     gain = qty * distance * strategy.TP_R - notional * FEE_RATE * 2
     max_leverage = max(1, math.floor(60 / signal["risk_pct"]))
     min_leverage = max(1, math.ceil(notional / (deposit * 0.9)))
+    rec_leverage = min(max(math.ceil(notional / (deposit * 0.45)), min_leverage), max(max_leverage, min_leverage))
     return {
         "qty": qty, "notional": notional, "loss": loss, "gain": gain,
         "loss_pct": loss / deposit * 100, "forced": forced,
-        "min_leverage": min_leverage, "max_leverage": max_leverage,
+        "min_leverage": min_leverage, "max_leverage": max_leverage, "rec_leverage": rec_leverage,
         "skip": loss > 2.5 * wanted_risk and loss / deposit * 100 > 3 or min_leverage > max_leverage,
     }
 
@@ -355,7 +356,7 @@ def format_new_signal(signal: dict[str, Any], deposit: float, risk_pct: float, i
         lines += [
             f"💵 <b>Ваш размер</b> (${deposit:g}, риск {risk_pct:g}%)",
             f"Объём <code>{fmt_qty(plan['qty'], info['step'])}</code> {coin} (≈ ${plan['notional']:.2f}) · "
-            f"плечо {plan['min_leverage']}–{plan['max_leverage']}x, маржа «Изолированная»",
+            f"плечо <b>{plan['rec_leverage']}x</b>, маржа «Изолированная»",
             f"❌ Стоп <b>−${plan['loss']:.2f}</b> ({plan['loss_pct']:.1f}%) · ✅ Тейк <b>+${plan['gain']:.2f}</b>",
         ]
         if plan["skip"]:
@@ -368,10 +369,10 @@ def format_new_signal(signal: dict[str, Any], deposit: float, risk_pct: float, i
         LINE,
         "🛠 <b>Как открыть сделку в приложении Bybit</b>",
         f"1. Вверху «Фьючерсы» → «Криптовалюта» → «Бессрочные» → «USDT» → пара <b>{coin}USDT</b>.",
-        "2. Маржа «Изолированная», плечо из диапазона выше.",
-        f"3. Тип ордера «Рыночный», объём как выше, кнопка "
+        "2. Режим маржи «Изолированная» (не «Кросс»), плечо как указано выше. Убыток по стопу от плеча не зависит.",
+        f"3. Тип ордера «Рыночный» (не лимитный и не условный), объём как выше, кнопка "
         f"{'«Купить / Лонг»' if is_long else '«Продать / Шорт»'}.",
-        "4. Включите «Тейк-профит / Стоп-лосс» и впишите цены стопа и тейка.",
+        "4. Включите «Тейк-профит / Стоп-лосс», впишите цены стопа и тейка выше, тип срабатывания «Последняя цена».",
         "5. Больше ничего не нужно: биржа сама закроет сделку.",
         f"📋 Стоп не двигать. Не закрылась за {strategy.MAX_BARS // 6} дней — закрыть вручную. "
         "Не больше 2 сделок сразу.",
@@ -1230,7 +1231,7 @@ async def calc_command(message: Message, command: CommandObject) -> None:
         f"(−{signal['risk_pct']:.2f}%) · 🎯 Тейк 1R <code>{fmt_price(take)}</code>",
         f"💼 Депозит ${deposit:g}, риск {risk_pct:g}%",
         f"Объём <code>{fmt_qty(plan['qty'], info['step'])}</code> {coin} (≈ ${plan['notional']:.2f})",
-        f"Плечо {plan['min_leverage']}–{plan['max_leverage']}x, маржа «Изолированная»",
+        f"Плечо <b>{plan['rec_leverage']}x</b>, маржа «Изолированная»",
         f"❌ Стоп <b>−${plan['loss']:.2f}</b> ({plan['loss_pct']:.1f}%) · ✅ Тейк <b>+${plan['gain']:.2f}</b>",
     ]
     if plan["skip"]:
