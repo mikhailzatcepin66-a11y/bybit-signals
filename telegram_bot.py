@@ -13,10 +13,11 @@ from typing import Any
 from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram import F
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -27,6 +28,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 
+import charts
 import strategy
 from main import SYMBOLS, engine, start_market_data, stop_market_data
 
@@ -313,61 +315,59 @@ def size_position(signal: dict[str, Any], deposit: float, risk_pct: float, info:
     }
 
 
+LINE = "━━━━━━━━━━━━━━━"
+
+
+def progress_bar(signal: dict[str, Any], price: float | None) -> str:
+    """Шкала от стопа до тейка с маркером текущей цены."""
+    if not price:
+        return ""
+    stop, take = signal["stop_loss"], signal["take_profit"]
+    pos = min(max((price - stop) / (take - stop), 0.0), 1.0)
+    cells = ["░"] * 10
+    cells[round(pos * 9)] = "●"
+    r_now = (price - signal["entry"]) / signal["risk"] * (1 if signal["side"] == "LONG" else -1)
+    return f"🛑 {''.join(cells)} 🎯  <b>{r_now:+.2f}R</b>"
+
+
 def format_new_signal(signal: dict[str, Any], deposit: float, risk_pct: float, info: dict[str, float] | None) -> str:
     is_long = signal["side"] == "LONG"
-    symbol = signal["symbol"]
-    coin = symbol.removesuffix("USDT")
+    coin = signal["symbol"].removesuffix("USDT")
     sl_pct = signal["risk_pct"]
     tp_pct = sl_pct * strategy.TP_R
-    action = "LONG — покупка" if is_long else "SHORT — продажа"
     lines = [
-        f"{'🟢' if is_long else '🔴'} <b>Новый сигнал — {coin}/USDT</b>",
-        f"<b>{action}</b> · свечи 4ч",
-        "",
-        "<b>📍 Цены</b>",
-        f"Вход: <code>{fmt_price(signal['entry'])}</code> (по рынку)",
-        f"Стоп-лосс: <code>{fmt_price(signal['stop_loss'])}</code>  (−{sl_pct:.2f}%)",
-        f"Тейк-профит: <code>{fmt_price(signal['take_profit'])}</code>  (+{tp_pct:.2f}%)",
-        f"⏱ Входить можно, пока цена {'не выше' if is_long else 'не ниже'} "
-        f"<code>{fmt_price(signal['max_entry'])}</code>. Дальше — вход упущен, пропустите.",
-        "",
+        f"{'🟢' if is_long else '🔴'} <b>{'LONG' if is_long else 'SHORT'} · {coin}/USDT</b> · 4ч",
+        LINE,
+        f"📍 Вход  <code>{fmt_price(signal['entry'])}</code>",
+        f"🛑 Стоп  <code>{fmt_price(signal['stop_loss'])}</code>  (−{sl_pct:.2f}%)",
+        f"🎯 Тейк  <code>{fmt_price(signal['take_profit'])}</code>  (+{tp_pct:.2f}%)",
+        f"⏱ Входить, пока цена {'не выше' if is_long else 'не ниже'} "
+        f"<code>{fmt_price(signal['max_entry'])}</code>, иначе пропустите.",
+        LINE,
     ]
     if info is None:
-        lines += [f"<b>💵 Размер</b>\nРискуйте не более {risk_pct:g}% депозита.", ""]
+        lines.append(f"💵 Рискуйте не более {risk_pct:g}% депозита.")
     else:
         plan = size_position(signal, deposit, risk_pct, info)
         lines += [
-            f"<b>💵 Ваш размер</b> (депозит ${deposit:g}, риск {risk_pct:g}%)",
-            f"Объём: <code>{fmt_qty(plan['qty'], info['step'])}</code> {coin} (≈ ${plan['notional']:.2f})",
-            f"Плечо: {plan['min_leverage']}x–{plan['max_leverage']}x, режим Isolated",
-            f"Если стоп: <b>−${plan['loss']:.2f}</b> ({plan['loss_pct']:.1f}% депозита)",
-            f"Если тейк: <b>+${plan['gain']:.2f}</b>",
+            f"💵 <b>Ваш размер</b> (${deposit:g}, риск {risk_pct:g}%)",
+            f"Объём <code>{fmt_qty(plan['qty'], info['step'])}</code> {coin} (≈ ${plan['notional']:.2f}) · "
+            f"плечо {plan['min_leverage']}–{plan['max_leverage']}x, Isolated",
+            f"❌ Стоп <b>−${plan['loss']:.2f}</b> ({plan['loss_pct']:.1f}%) · ✅ Тейк <b>+${plan['gain']:.2f}</b>",
         ]
         if plan["skip"]:
             lines.append(
-                "⚠️ <b>Этот сигнал лучше пропустить:</b> минимальный объём биржи "
-                "слишком велик для вашего депозита."
+                "⚠️ <b>Лучше пропустить:</b> минимальный объём биржи слишком велик для вашего депозита."
             )
         elif plan["forced"]:
-            lines.append(
-                f"⚠️ Минимальный объём {coin} больше расчётного, риск выше {risk_pct:g}%."
-            )
-        lines.append("")
+            lines.append(f"⚠️ Минимальный объём {coin} больше расчётного, риск выше {risk_pct:g}%.")
     lines += [
-        "<b>🛠 Как поставить в Bybit</b>",
-        "1. Деривативы → USDT Perpetual → выберите пару.",
-        "2. Isolated, плечо из диапазона выше.",
-        f"3. Тип Market, объём как выше, кнопка {'Buy / Long' if is_long else 'Sell / Short'}.",
-        "4. Включите TP/SL, укажите цены стопа и тейка (Mark Price).",
-        "5. Больше ничего не нужно: биржа сама закроет сделку.",
-        "",
-        "<b>📋 Правила</b>",
-        "• Стоп не двигайте и не убирайте.",
-        f"• Если за {strategy.MAX_BARS // 6} дней сделка не закрылась, закройте вручную.",
-        "• Одновременно не больше 2 сделок.",
-        "",
-        f"<i>📊 В тесте за 2 года: ≈{WIN_RATE}% сделок в плюс. Прибыль достигается "
-        "серией сделок, а не каждой отдельной.</i>",
+        LINE,
+        f"🛠 Bybit: USDT Perpetual → Isolated → Market → {'Buy / Long' if is_long else 'Sell / Short'} → "
+        "TP/SL по Mark Price. Больше ничего не нужно.",
+        f"📋 Стоп не двигать. Не закрылась за {strategy.MAX_BARS // 6} дней — закрыть вручную. "
+        "Не больше 2 сделок сразу.",
+        f"<i>📊 В тесте за 2 года ≈{WIN_RATE}% сделок в плюс; прибыль даёт серия сделок.</i>",
     ]
     return "\n".join(lines)
 
@@ -521,8 +521,35 @@ async def send_message(bot: Bot, chat_id: int, text: str, markup: InlineKeyboard
     return False
 
 
+async def send_photo(bot: Bot, chat_id: int, png: bytes, caption: str = "") -> None:
+    silent = in_quiet(store.get_prefs(chat_id))
+    try:
+        await bot.send_photo(
+            chat_id, BufferedInputFile(png, "chart.png"), caption=caption or None, disable_notification=silent
+        )
+    except TelegramAPIError:
+        logger.exception("Could not send photo to chat %s", chat_id)
+
+
+def my_equity_png(chat_id: int, days: int | None = None) -> bytes | None:
+    tz = store.get_prefs(chat_id)["tz"]
+    start = period_start(tz, days) if days else None
+    rows = [(dt, r) for dt, r in store.closed_trades(chat_id) if start is None or dt + timedelta(hours=tz) >= start]
+    title = "Your trades" if rows else "Bot signals"
+    if not rows:
+        rows = store.all_closed()
+    return charts.equity_chart([r for _, r in rows], title)
+
+
+async def send_equity(bot: Bot, chat_id: int, days: int | None = None) -> None:
+    png = await asyncio.to_thread(my_equity_png, chat_id, days)
+    if png:
+        await send_photo(bot, chat_id, png)
+
+
 async def notify_subscribers(
-    bot: Bot, build_text: Any, symbol: str | None = None, signal_id: str | None = None
+    bot: Bot, build_text: Any, symbol: str | None = None, signal_id: str | None = None,
+    photo: bytes | None = None,
 ) -> None:
     for chat_id in store.list_chat_ids():
         took = signal_id is not None and store.trade_state(chat_id, signal_id) == 1
@@ -530,6 +557,8 @@ async def notify_subscribers(
             continue
         built = await build_text(chat_id)
         text, markup = built if isinstance(built, tuple) else (built, None)
+        if photo and not pause_reason(chat_id):
+            await send_photo(bot, chat_id, photo)
         await send_message(bot, chat_id, text, markup)
 
 
@@ -540,6 +569,12 @@ async def handle_market_event(bot: Bot, event: dict[str, Any]) -> None:
     signal = event.get("signal")
     if event["type"] == "signal":
         info = await instrument(signal["symbol"])
+        history = list(engine.candles.get((signal["symbol"], strategy.TIMEFRAME), []))
+        try:
+            photo = await asyncio.to_thread(charts.signal_chart, history, signal)
+        except Exception:
+            logger.exception("Chart failed")
+            photo = None
 
         async def build(chat_id: int) -> Any:
             deposit, risk_pct = store.get_settings(chat_id)
@@ -559,7 +594,7 @@ async def handle_market_event(bot: Bot, event: dict[str, Any]) -> None:
             )
             return text, trade_keyboard(signal["id"], None)
 
-        await notify_subscribers(bot, build, signal["symbol"])
+        await notify_subscribers(bot, build, signal["symbol"], photo=photo)
     elif event["type"] == "signal_update":
         store.record_result(signal)
         text = format_update(signal)
@@ -603,6 +638,7 @@ async def send_reminders(bot: Bot) -> None:
         reminders = (
             (f"age:{signal['id']}", age_h >= REMIND_AGE_HOURS,
              f"⏰ <b>{coin}: сделка открыта уже {age_h / 24:.0f} дн.</b>\n"
+             f"{progress_bar(signal, engine.prices.get(signal['symbol']))}\n"
              f"Проверьте, что на бирже стоят SL <code>{fmt_price(signal['stop_loss'])}</code> и "
              f"TP <code>{fmt_price(signal['take_profit'])}</code>. "
              f"Если сделка не закроется сама, через {left_h / 24:.1f} дн. её нужно закрыть вручную."),
@@ -633,6 +669,7 @@ async def send_reports(bot: Bot) -> None:
         if now.weekday() == 6 and not store.reminded(chat_id, week_key):
             store.mark_reminded(chat_id, week_key)
             await send_message(bot, chat_id, format_period_report(chat_id, 7)[0])
+            await send_equity(bot, chat_id, 7)
 
 
 def backup_data() -> None:
@@ -696,9 +733,9 @@ HELP = (
 
 MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Статус"), KeyboardButton(text="📈 Статистика")],
-        [KeyboardButton(text="💰 Депозит и риск"), KeyboardButton(text="🧾 История")],
-        [KeyboardButton(text="🪙 Монеты"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="📊 Дашборд"), KeyboardButton(text="📈 Отчёты")],
+        [KeyboardButton(text="🧾 История"), KeyboardButton(text="🪙 Монеты")],
+        [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
 )
@@ -847,7 +884,7 @@ def settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[deposits, risks, limits, week_limits, quiet])
 
 
-@router.message(F.text == "📊 Статус")
+@router.message(F.text.in_({"📊 Статус", "📊 Дашборд"}))
 async def menu_status(message: Message) -> None:
     await status_command(message)
 
@@ -857,7 +894,7 @@ async def menu_history(message: Message) -> None:
     await history_command(message)
 
 
-@router.message(F.text == "📈 Статистика")
+@router.message(F.text.in_({"📈 Статистика", "📈 Отчёты"}))
 async def menu_stats(message: Message) -> None:
     await stats_command(message)
 
@@ -867,7 +904,7 @@ async def menu_help(message: Message) -> None:
     await message.answer(HELP)
 
 
-@router.message(F.text == "💰 Депозит и риск")
+@router.message(F.text.in_({"💰 Депозит и риск", "⚙️ Настройки"}))
 async def menu_settings(message: Message) -> None:
     await message.answer(settings_text(message.chat.id), reply_markup=settings_keyboard(message.chat.id))
 
@@ -889,7 +926,7 @@ async def start_command(message: Message) -> None:
     deposit, risk_pct = store.get_settings(message.chat.id)
     await message.answer(
         f"Вы подписаны. Депозит ${deposit:g}, риск {risk_pct:g}% на сделку.\n"
-        "Измените кнопкой «💰 Депозит и риск».\n\n" + HELP,
+        "Измените в разделе «⚙️ Настройки».\n\n" + HELP,
         reply_markup=MENU,
     )
 
@@ -1023,6 +1060,7 @@ async def stats_command(message: Message) -> None:
         "<i>1R = сумма риска на сделку, без учёта комиссий.</i>"
         + personal_stats(message.chat.id)
     )
+    await send_equity(message.bot, message.chat.id)
 
 
 STATUS_ICONS = {"COMPLETED": "✅ тейк", "STOPPED": "❌ стоп", "EXPIRED": "⏹ время"}
@@ -1043,26 +1081,69 @@ async def history_command(message: Message) -> None:
     await message.answer("\n".join(lines))
 
 
-@router.message(Command("status"))
-async def status_command(message: Message) -> None:
-    lines = ["<b>Цены</b>"]
+def money(chat_id: int, results: list[float]) -> str:
+    deposit, risk_pct = store.get_settings(chat_id)
+    return f"{sum(results):+.1f}R ≈ {sum(results) * deposit * risk_pct / 100:+.2f}$"
+
+
+def dashboard_text(chat_id: int) -> str:
+    deposit, risk_pct = store.get_settings(chat_id)
+    prefs = store.get_prefs(chat_id)
+    lines = [f"📊 <b>Дашборд</b> · {local_now(prefs['tz']):%H:%M}", LINE]
     for symbol in SYMBOLS:
         price = engine.prices.get(symbol)
-        lines.append(f"{symbol}: <code>{fmt_price(price) if price else 'ожидание данных'}</code>")
+        lines.append(f"<b>{symbol.removesuffix('USDT')}</b>  <code>{fmt_price(price) if price else '…'}</code>")
+    lines.append(LINE)
     active = [s for s in engine.signals if s["status"] == "ACTIVE"]
+    taken = set(store.open_taken(chat_id))
     if active:
-        lines.append("\n<b>Открытые сигналы:</b>")
+        lines.append("<b>Открытые сигналы</b>")
         for s in active:
-            lines.append(
-                f"{s['side']} {s['symbol']} · вход <code>{fmt_price(s['entry'])}</code> · "
-                f"SL <code>{fmt_price(s['stop_loss'])}</code> · TP <code>{fmt_price(s['take_profit'])}</code>"
-            )
+            mark = " · вы в сделке" if s["id"] in taken else ""
+            lines += [
+                f"{'🟢' if s['side'] == 'LONG' else '🔴'} {s['side']} {s['symbol'].removesuffix('USDT')}{mark}",
+                f"вход <code>{fmt_price(s['entry'])}</code> · SL <code>{fmt_price(s['stop_loss'])}</code> · "
+                f"TP <code>{fmt_price(s['take_profit'])}</code>",
+                progress_bar(s, engine.prices.get(s["symbol"])),
+            ]
     else:
-        lines.append("\nОткрытых сигналов нет — ждём подходящую свечу 4h.")
-    deposit, risk_pct = store.get_settings(message.chat.id)
-    lines.append(f"\nДепозит ${deposit:g} · риск {risk_pct:g}%")
+        lines.append("Открытых сигналов нет — ждём подходящую свечу 4ч.")
+    lines.append(LINE)
+    lines.append(f"💼 Депозит ${deposit:g} · риск {risk_pct:g}%")
+    day = my_results(chat_id, 1)
+    week = my_results(chat_id, since=week_start(prefs["tz"]))
+    lines.append(f"Сегодня: {money(chat_id, day)} ({len(day)} сд.)")
+    lines.append(f"Неделя: {money(chat_id, week)} ({len(week)} сд.)")
+    reason = pause_reason(chat_id)
+    if reason:
+        lines.append("⛔ Пауза: " + ("недельный лимит, до понедельника" if reason == "week" else "дневной лимит, до завтра"))
+    else:
+        lines.append(
+            f"🛡 Лимиты: день {abs(min(sum(day), 0)):.1f}/{prefs['loss_limit']:g}R · "
+            f"неделя {abs(min(sum(week), 0)):.1f}/{prefs['week_limit']:g}R"
+        )
     lines.append(feed_status())
-    await message.answer("\n".join(lines))
+    return "\n".join(lines)
+
+
+DASH_KEYBOARD = InlineKeyboardMarkup(
+    inline_keyboard=[[InlineKeyboardButton(text="🔄 Обновить", callback_data="dash")]]
+)
+
+
+@router.message(Command("status"))
+async def status_command(message: Message) -> None:
+    await message.answer(dashboard_text(message.chat.id), reply_markup=DASH_KEYBOARD)
+
+
+@router.callback_query(F.data == "dash")
+async def dashboard_callback(query: CallbackQuery) -> None:
+    try:
+        if query.message:
+            await query.message.edit_text(dashboard_text(query.from_user.id), reply_markup=DASH_KEYBOARD)
+    except TelegramBadRequest:
+        pass
+    await query.answer("Обновлено")
 
 
 async def run() -> None:
