@@ -3,6 +3,8 @@ import logging
 import math
 import os
 import sqlite3
+import time
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -34,10 +36,19 @@ DEFAULT_DEPOSIT = 20.0
 DEFAULT_RISK_PCT = 1.0
 FEE_RATE = 0.00055
 WIN_RATE = 60
+PREF_DEFAULTS = {"tz": 3, "quiet_start": -1, "quiet_end": -1, "loss_limit": 2.0}
+REPORT_HOUR = 21
+REMIND_AGE_HOURS = 72
+WATCHDOG_SECONDS = 300
+LAST = {"tick": time.monotonic(), "stalled": False}
 logger = logging.getLogger("bybit-telegram")
 router = Router()
 dispatcher = Dispatcher()
 dispatcher.include_router(router)
+
+
+def _utc(text: str) -> datetime:
+    return datetime.strptime(str(text)[:19], "%Y-%m-%d %H:%M:%S")
 
 
 class Store:
@@ -55,6 +66,25 @@ class Store:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS muted ("
                 "chat_id INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY (chat_id, symbol))"
+            )
+            for column, definition in (
+                ("tz", "INTEGER NOT NULL DEFAULT 3"),
+                ("quiet_start", "INTEGER NOT NULL DEFAULT -1"),
+                ("quiet_end", "INTEGER NOT NULL DEFAULT -1"),
+                ("loss_limit", "REAL NOT NULL DEFAULT 2.0"),
+            ):
+                try:
+                    db.execute(f"ALTER TABLE settings ADD COLUMN {column} {definition}")
+                except sqlite3.OperationalError:
+                    pass
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS trades ("
+                "chat_id INTEGER NOT NULL, signal_id TEXT NOT NULL, taken INTEGER NOT NULL, "
+                "PRIMARY KEY (chat_id, signal_id))"
+            )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS reminders ("
+                "chat_id INTEGER NOT NULL, key TEXT NOT NULL, PRIMARY KEY (chat_id, key))"
             )
             db.execute(
                 "CREATE TABLE IF NOT EXISTS journal ("
@@ -120,6 +150,76 @@ class Store:
             ).fetchall()
         return [(r[0], float(r[1]), float(r[2])) for r in rows]
 
+
+    def get_prefs(self, chat_id: int) -> dict[str, Any]:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT tz, quiet_start, quiet_end, loss_limit FROM settings WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+        if not row:
+            return dict(PREF_DEFAULTS)
+        return {"tz": int(row[0]), "quiet_start": int(row[1]), "quiet_end": int(row[2]),
+                "loss_limit": float(row[3])}
+
+    def set_pref(self, chat_id: int, **values: float) -> None:
+        if not set(values) <= set(PREF_DEFAULTS):
+            raise ValueError(values)
+        self.subscribe(chat_id)
+        with self._connect() as db:
+            for column, value in values.items():
+                db.execute(f"UPDATE settings SET {column} = ? WHERE chat_id = ?", (value, chat_id))
+
+    def mark_trade(self, chat_id: int, signal_id: str, taken: int) -> None:
+        with self._connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO trades (chat_id, signal_id, taken) VALUES (?, ?, ?)",
+                (chat_id, signal_id, taken),
+            )
+
+    def trade_state(self, chat_id: int, signal_id: str) -> int | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT taken FROM trades WHERE chat_id = ? AND signal_id = ?", (chat_id, signal_id)
+            ).fetchone()
+        return int(row[0]) if row else None
+
+    def taken_by(self, signal_id: str) -> list[int]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT chat_id FROM trades WHERE signal_id = ? AND taken = 1", (signal_id,)
+            ).fetchall()
+        return [int(r[0]) for r in rows]
+
+    def closed_trades(self, chat_id: int) -> list[tuple[datetime, float]]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT j.closed_at, j.result_r FROM trades t JOIN journal j ON j.signal_id = t.signal_id "
+                "WHERE t.chat_id = ? AND t.taken = 1 ORDER BY j.closed_at", (chat_id,)
+            ).fetchall()
+        return [(_utc(r[0]), float(r[1])) for r in rows]
+
+    def all_closed(self) -> list[tuple[datetime, float]]:
+        with self._connect() as db:
+            rows = db.execute("SELECT closed_at, result_r FROM journal ORDER BY closed_at").fetchall()
+        return [(_utc(r[0]), float(r[1])) for r in rows]
+
+    def open_taken(self, chat_id: int) -> list[str]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT signal_id FROM trades WHERE chat_id = ? AND taken = 1 "
+                "AND signal_id NOT IN (SELECT signal_id FROM journal)", (chat_id,)
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def reminded(self, chat_id: int, key: str) -> bool:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT 1 FROM reminders WHERE chat_id = ? AND key = ?", (chat_id, key)
+            ).fetchone() is not None
+
+    def mark_reminded(self, chat_id: int, key: str) -> None:
+        with self._connect() as db:
+            db.execute("INSERT OR IGNORE INTO reminders (chat_id, key) VALUES (?, ?)", (chat_id, key))
 
     def muted(self, chat_id: int) -> set[str]:
         with self._connect() as db:
@@ -289,42 +389,143 @@ def format_update(signal: dict[str, Any]) -> str:
     )
 
 
-def format_report(signal: dict[str, Any], deposit: float, risk_pct: float) -> str:
-    results = [r for _, r, _ in store.journal()]
+def local_now(tz: int) -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=tz)
+
+
+def in_quiet(prefs: dict[str, Any]) -> bool:
+    start, end = prefs["quiet_start"], prefs["quiet_end"]
+    if start < 0 or start == end:
+        return False
+    hour = local_now(prefs["tz"]).hour
+    return start <= hour < end if start < end else hour >= start or hour < end
+
+
+def period_start(tz: int, days: int) -> datetime:
+    today = local_now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    return today - timedelta(days=days - 1)
+
+
+def my_results(chat_id: int, days: int | None = None) -> list[float]:
+    prefs = store.get_prefs(chat_id)
+    tz = prefs["tz"]
+    start = period_start(tz, days) if days else None
+    return [r for dt, r in store.closed_trades(chat_id) if start is None or dt + timedelta(hours=tz) >= start]
+
+
+def is_paused(chat_id: int) -> bool:
+    limit = store.get_prefs(chat_id)["loss_limit"]
+    return limit > 0 and sum(my_results(chat_id, 1)) <= -limit
+
+
+def feed_status() -> str:
+    age = time.monotonic() - LAST["tick"]
+    if age <= WATCHDOG_SECONDS:
+        return "🟢 Бот работает, данные Bybit идут."
+    return f"🔴 Нет данных от Bybit уже {age / 60:.0f} мин."
+
+
+def format_report(signal: dict[str, Any], deposit: float, risk_pct: float, chat_id: int) -> str:
+    if store.trade_state(chat_id, signal["id"]) != 1:
+        return "ℹ️ Вы не отметили вход по этому сигналу — в ваш личный отчёт он не попал."
+    results = my_results(chat_id)
     wins = sum(1 for r in results if r > 0)
     money = signal["result_r"] * deposit * risk_pct / 100
     verdict = "✅ Успешно" if signal["result_r"] > 0 else "❌ Неудачно"
     total_money = sum(results) * deposit * risk_pct / 100
-    return (
-        "<b>📑 Отчёт по сигналу</b>\n"
+    text = (
+        "<b>📑 Ваш отчёт по сигналу</b>\n"
         f"{verdict}: {signal['side']} {signal['symbol'].removesuffix('USDT')} · "
         f"{signal['result_r']:+.2f}R ≈ <b>{money:+.2f}$</b> (депозит ${deposit:g}, риск {risk_pct:g}%)\n"
-        f"<b>Всего закрыто:</b> {len(results)} · в плюс {wins} ({wins / len(results) * 100:.0f}%) · "
+        f"<b>Всего ваших сделок:</b> {len(results)} · в плюс {wins} ({wins / len(results) * 100:.0f}%) · "
         f"итог {sum(results):+.1f}R ≈ {total_money:+.2f}$"
     )
+    if is_paused(chat_id):
+        limit = store.get_prefs(chat_id)["loss_limit"]
+        text += (
+            f"\n\n⛔ <b>Дневной лимит убытка ({limit:g}R) достигнут.</b>\n"
+            "На сегодня хватит: не входите в новые сделки и не пытайтесь отыграться. Завтра — с чистого листа."
+        )
+    return text
 
 
-async def notify_subscribers(bot: Bot, build_text: Any, symbol: str | None = None) -> None:
+def format_period_report(chat_id: int, days: int) -> tuple[str, bool]:
+    deposit, risk_pct = store.get_settings(chat_id)
+    tz = store.get_prefs(chat_id)["tz"]
+    start = period_start(tz, days)
+    everyone = [r for dt, r in store.all_closed() if dt + timedelta(hours=tz) >= start]
+    mine = my_results(chat_id, days)
+    opened = store.open_taken(chat_id)
+    lines = ["<b>📅 Итоги дня</b>" if days == 1 else "<b>🗓 Итоги недели</b>"]
+    lines.append(
+        f"Сигналов закрыто ботом: {len(everyone)} · в плюс {sum(1 for r in everyone if r > 0)} · "
+        f"сумма {sum(everyone):+.1f}R"
+    )
+    if mine:
+        lines.append(
+            f"Ваши сделки: {len(mine)} · в плюс {sum(1 for r in mine if r > 0)} · "
+            f"итог {sum(mine):+.1f}R ≈ <b>{sum(mine) * deposit * risk_pct / 100:+.2f}$</b>"
+        )
+    else:
+        lines.append("Ваши сделки: закрытых нет (отмечайте «Я вошёл» под сигналом).")
+    if opened:
+        lines.append(f"Открыто сейчас: {len(opened)}")
+    lines.append(feed_status())
+    return "\n".join(lines), bool(everyone or mine or opened)
+
+
+def trade_keyboard(signal_id: str, state: int | None) -> InlineKeyboardMarkup:
+    yes = "✅ Я вошёл" + (" ✔" if state == 1 else "")
+    no = "⏭ Пропустил" + (" ✔" if state == 0 else "")
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=yes, callback_data=f"take:{signal_id}"),
+        InlineKeyboardButton(text=no, callback_data=f"skip:{signal_id}"),
+    ]])
+
+
+async def send_message(bot: Bot, chat_id: int, text: str, markup: InlineKeyboardMarkup | None = None) -> bool:
+    silent = in_quiet(store.get_prefs(chat_id))
+    try:
+        await bot.send_message(chat_id, text, reply_markup=markup, disable_notification=silent)
+        return True
+    except TelegramForbiddenError:
+        logger.info("Removing blocked subscriber chat %s", chat_id)
+        store.unsubscribe(chat_id)
+    except TelegramAPIError:
+        logger.exception("Could not send notification to chat %s", chat_id)
+    return False
+
+
+async def notify_subscribers(
+    bot: Bot, build_text: Any, symbol: str | None = None, signal_id: str | None = None
+) -> None:
     for chat_id in store.list_chat_ids():
-        if symbol and symbol in store.muted(chat_id):
+        took = signal_id is not None and store.trade_state(chat_id, signal_id) == 1
+        if symbol and symbol in store.muted(chat_id) and not took:
             continue
-        try:
-            await bot.send_message(chat_id, await build_text(chat_id))
-        except TelegramForbiddenError:
-            logger.info("Removing blocked subscriber chat %s", chat_id)
-            store.unsubscribe(chat_id)
-        except TelegramAPIError:
-            logger.exception("Could not send notification to chat %s", chat_id)
+        built = await build_text(chat_id)
+        text, markup = built if isinstance(built, tuple) else (built, None)
+        await send_message(bot, chat_id, text, markup)
 
 
 async def handle_market_event(bot: Bot, event: dict[str, Any]) -> None:
+    if event["type"] == "ticker":
+        LAST["tick"] = time.monotonic()
+        return
     signal = event.get("signal")
     if event["type"] == "signal":
         info = await instrument(signal["symbol"])
 
-        async def build(chat_id: int) -> str:
+        async def build(chat_id: int) -> Any:
             deposit, risk_pct = store.get_settings(chat_id)
-            return format_new_signal(signal, deposit, risk_pct, info)
+            text = format_new_signal(signal, deposit, risk_pct, info)
+            if is_paused(chat_id):
+                return "⛔ <b>Дневной лимит убытка достигнут — этот сигнал пропустите.</b>\n\n" + text
+            text += (
+                "\n\n<i>Если войдёте, нажмите «Я вошёл»: сделка попадёт в вашу статистику, "
+                "и бот напомнит о ней.</i>"
+            )
+            return text, trade_keyboard(signal["id"], None)
 
         await notify_subscribers(bot, build, signal["symbol"])
     elif event["type"] == "signal_update":
@@ -333,22 +534,102 @@ async def handle_market_event(bot: Bot, event: dict[str, Any]) -> None:
 
         async def build(chat_id: int) -> str:
             deposit, risk_pct = store.get_settings(chat_id)
-            return text + "\n\n" + format_report(signal, deposit, risk_pct)
+            return text + "\n\n" + format_report(signal, deposit, risk_pct, chat_id)
 
-        await notify_subscribers(bot, build, signal["symbol"])
+        await notify_subscribers(bot, build, signal["symbol"], signal["id"])
+
+
+async def check_feed(bot: Bot) -> None:
+    age = time.monotonic() - LAST["tick"]
+    if age > WATCHDOG_SECONDS and not LAST["stalled"]:
+        LAST["stalled"] = True
+        text = (
+            "🔴 <b>Нет данных от Bybit более 5 минут.</b>\n"
+            "Новые сигналы и закрытия сделок временно не приходят. Следите за открытыми сделками на бирже."
+        )
+    elif age <= WATCHDOG_SECONDS and LAST["stalled"]:
+        LAST["stalled"] = False
+        text = "🟢 <b>Данные Bybit восстановлены.</b> Бот снова работает."
+    else:
+        return
+
+    async def build(_: int) -> str:
+        return text
+
+    await notify_subscribers(bot, build)
+
+
+async def send_reminders(bot: Bot) -> None:
+    now = datetime.now(timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
+    for signal in engine.signals:
+        if signal["status"] != "ACTIVE":
+            continue
+        coin = signal["symbol"].removesuffix("USDT")
+        age_h = (now - datetime.fromisoformat(signal["created_at"])).total_seconds() / 3600
+        left_h = (signal["expires_at"] - now_ms) / 3_600_000
+        reminders = (
+            (f"age:{signal['id']}", age_h >= REMIND_AGE_HOURS,
+             f"⏰ <b>{coin}: сделка открыта уже {age_h / 24:.0f} дн.</b>\n"
+             f"Проверьте, что на бирже стоят SL <code>{fmt_price(signal['stop_loss'])}</code> и "
+             f"TP <code>{fmt_price(signal['take_profit'])}</code>. "
+             f"Если сделка не закроется сама, через {left_h / 24:.1f} дн. её нужно закрыть вручную."),
+            (f"exp:{signal['id']}", left_h <= 24,
+             f"⏰ <b>{coin}: меньше суток до закрытия по времени.</b>\n"
+             "Если сделка до этого не дойдёт ни до тейка, ни до стопа, закройте её вручную по рынку "
+             "и отмените TP/SL."),
+        )
+        for chat_id in store.taken_by(signal["id"]):
+            for key, due, text in reminders:
+                if due and not store.reminded(chat_id, key):
+                    store.mark_reminded(chat_id, key)
+                    await send_message(bot, chat_id, text)
+
+
+async def send_reports(bot: Bot) -> None:
+    for chat_id in store.list_chat_ids():
+        now = local_now(store.get_prefs(chat_id)["tz"])
+        if now.hour < REPORT_HOUR:
+            continue
+        day_key = f"daily:{now:%Y-%m-%d}"
+        if not store.reminded(chat_id, day_key):
+            store.mark_reminded(chat_id, day_key)
+            text, active = format_period_report(chat_id, 1)
+            if active:
+                await send_message(bot, chat_id, text)
+        week_key = f"weekly:{now:%G-%V}"
+        if now.weekday() == 6 and not store.reminded(chat_id, week_key):
+            store.mark_reminded(chat_id, week_key)
+            await send_message(bot, chat_id, format_period_report(chat_id, 7)[0])
+
+
+async def background_loop(bot: Bot) -> None:
+    while True:
+        await asyncio.sleep(60)
+        for step in (check_feed, send_reminders, send_reports):
+            try:
+                await step(bot)
+            except Exception:
+                logger.exception("Background step %s failed", step.__name__)
 
 
 HELP = (
     "<b>Бот сигналов Bybit</b> (стратегия «откат по тренду», 4h)\n"
     f"Монеты: {', '.join(s.removesuffix('USDT') for s in SYMBOLS)}\n\n"
-    "/status — цены и открытые сигналы\n"
-    "/deposit 20 — ваш депозит в $\n"
-    "/risk 1 — риск на сделку в % депозита (0.25–2)\n"
+    "/status — цены, открытые сигналы, состояние бота\n"
     "/stats — итоги по закрытым сигналам\n"
-    "/history — последние 10 сигналов с результатом\n"
-    "/coins — выбрать монеты для сигналов\n"
+    "/history — последние 10 сигналов\n"
+    "/report — итоги дня, /week — итоги недели\n"
+    "/coins — выбрать монеты\n"
+    "/deposit 20 — депозит в $\n"
+    "/risk 1 — риск на сделку, % депозита (0.25–2)\n"
+    "/limit 2 — дневной лимит убытка в R (0 — выключить)\n"
+    "/quiet 23 7 — тихие часы (без звука), /quiet off — выключить\n"
+    "/tz 3 — ваш часовой пояс (UTC+3 — Москва)\n"
     "/stop — отключить уведомления\n\n"
-    "Сигналов в среднем 2–4 в неделю (по свечам 4ч), каждый приходит с готовой инструкцией."
+    "Сигналов в среднем 2–4 в неделю. Под каждым сигналом кнопки «Я вошёл» / «Пропустил» — "
+    "по ним бот ведёт вашу личную статистику, напоминает об открытых сделках и присылает отчёты "
+    "каждый день в 21:00 и в воскресенье итоги недели."
 )
 
 
@@ -401,10 +682,73 @@ async def coins_callback(query: CallbackQuery) -> None:
         await query.message.edit_reply_markup(reply_markup=coins_keyboard(chat_id))
 
 
+def settings_text(chat_id: int) -> str:
+    deposit, risk_pct = store.get_settings(chat_id)
+    prefs = store.get_prefs(chat_id)
+    limit = prefs["loss_limit"]
+    limit_text = f"{limit:g}R (≈ ${limit * deposit * risk_pct / 100:.2f})" if limit > 0 else "выключен"
+    quiet_text = (
+        f"{prefs['quiet_start']:02d}:00–{prefs['quiet_end']:02d}:00" if prefs["quiet_start"] >= 0 else "выключены"
+    )
+    return (
+        "<b>Настройки</b>\n"
+        f"Депозит: <b>${deposit:g}</b>\n"
+        f"Риск на сделку: <b>{risk_pct:g}%</b>\n"
+        f"Дневной лимит убытка: <b>{limit_text}</b>\n"
+        f"Тихие часы: <b>{quiet_text}</b> (сообщения приходят без звука)\n"
+        f"Часовой пояс: <b>UTC{prefs['tz']:+d}</b>\n\n"
+        "Ряды кнопок: депозит, риск, лимит убытка, тихие часы.\n"
+        "Команды: /deposit 75 · /risk 1 · /limit 2 · /quiet 23 7 · /tz 3"
+    )
+
+
+async def refresh_settings(query: CallbackQuery) -> None:
+    if query.message:
+        try:
+            await query.message.edit_text(settings_text(query.from_user.id), reply_markup=settings_keyboard())
+        except TelegramAPIError:
+            pass
+
+
+@router.callback_query(F.data.startswith(("lim:", "quiet:")))
+async def prefs_callback(query: CallbackQuery) -> None:
+    kind, _, raw = (query.data or "").partition(":")
+    if kind == "lim":
+        store.set_pref(query.from_user.id, loss_limit=float(raw))
+    elif raw == "off":
+        store.set_pref(query.from_user.id, quiet_start=-1, quiet_end=-1)
+    else:
+        start, end = (int(x) for x in raw.split("-"))
+        store.set_pref(query.from_user.id, quiet_start=start, quiet_end=end)
+    await query.answer("Сохранено")
+    await refresh_settings(query)
+
+
+@router.callback_query(F.data.startswith(("take:", "skip:")))
+async def trade_callback(query: CallbackQuery) -> None:
+    action, _, signal_id = (query.data or "").partition(":")
+    state = 1 if action == "take" else 0
+    store.mark_trade(query.from_user.id, signal_id, state)
+    await query.answer("Записал: вы вошли в сделку" if state else "Записал: сигнал пропущен")
+    if query.message:
+        try:
+            await query.message.edit_reply_markup(reply_markup=trade_keyboard(signal_id, state))
+        except TelegramAPIError:
+            pass
+
+
 def settings_keyboard() -> InlineKeyboardMarkup:
     deposits = [InlineKeyboardButton(text=f"${v}", callback_data=f"dep:{v}") for v in (20, 50, 100, 500)]
     risks = [InlineKeyboardButton(text=f"{v}%", callback_data=f"risk:{v}") for v in (0.5, 1, 1.5, 2)]
-    return InlineKeyboardMarkup(inline_keyboard=[deposits, risks])
+    limits = [
+        InlineKeyboardButton(text=("Лимит " if v else "") + (f"{v}R" if v else "Без лимита"), callback_data=f"lim:{v}")
+        for v in (1, 2, 3, 0)
+    ]
+    quiet = [
+        InlineKeyboardButton(text=label, callback_data=f"quiet:{value}")
+        for label, value in (("Тихие: выкл", "off"), ("23–07", "23-7"), ("00–08", "0-8"))
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[deposits, risks, limits, quiet])
 
 
 @router.message(F.text == "📊 Статус")
@@ -429,25 +773,15 @@ async def menu_help(message: Message) -> None:
 
 @router.message(F.text == "💰 Депозит и риск")
 async def menu_settings(message: Message) -> None:
-    deposit, risk_pct = store.get_settings(message.chat.id)
-    await message.answer(
-        f"Сейчас: депозит <b>${deposit:g}</b>, риск <b>{risk_pct:g}%</b>.\n"
-        "Верхний ряд — депозит, нижний — риск на сделку. Свой депозит: /deposit 75",
-        reply_markup=settings_keyboard(),
-    )
+    await message.answer(settings_text(message.chat.id), reply_markup=settings_keyboard())
 
 
 @router.callback_query(F.data.startswith(("dep:", "risk:")))
 async def settings_callback(query: CallbackQuery) -> None:
     kind, _, raw = (query.data or "").partition(":")
     store.set_setting(query.from_user.id, "deposit" if kind == "dep" else "risk_pct", float(raw))
-    deposit, risk_pct = store.get_settings(query.from_user.id)
     await query.answer("Сохранено")
-    if query.message:
-        await query.message.edit_text(
-            f"Сейчас: депозит <b>${deposit:g}</b>, риск <b>{risk_pct:g}%</b>.",
-            reply_markup=settings_keyboard(),
-        )
+    await refresh_settings(query)
 
 
 @router.message(CommandStart())
@@ -503,6 +837,64 @@ async def risk_command(message: Message, command: CommandObject) -> None:
     await message.answer(f"Риск на сделку: {value:g}% депозита.")
 
 
+@router.message(Command("limit"))
+async def limit_command(message: Message, command: CommandObject) -> None:
+    value = _parse_number(command)
+    if value is None or not 0 <= value <= 20:
+        await message.answer("Пример: /limit 2 — стоп на день после убытка 2R. /limit 0 — без лимита.")
+        return
+    store.set_pref(message.chat.id, loss_limit=value)
+    await message.answer(settings_text(message.chat.id))
+
+
+@router.message(Command("quiet"))
+async def quiet_command(message: Message, command: CommandObject) -> None:
+    arg = (command.args or "").strip().lower()
+    if arg == "off":
+        store.set_pref(message.chat.id, quiet_start=-1, quiet_end=-1)
+        await message.answer(settings_text(message.chat.id))
+        return
+    try:
+        start, end = (int(x) for x in arg.split())
+    except ValueError:
+        start = end = -1
+    if not (0 <= start <= 23 and 0 <= end <= 23 and start != end):
+        await message.answer("Пример: /quiet 23 7 — с 23:00 до 07:00 без звука. /quiet off — выключить.")
+        return
+    store.set_pref(message.chat.id, quiet_start=start, quiet_end=end)
+    await message.answer(settings_text(message.chat.id))
+
+
+@router.message(Command("tz"))
+async def tz_command(message: Message, command: CommandObject) -> None:
+    value = _parse_number(command)
+    if value is None or value != int(value) or not -12 <= value <= 14:
+        await message.answer("Пример: /tz 3 — для Москвы (UTC+3).")
+        return
+    store.set_pref(message.chat.id, tz=int(value))
+    await message.answer(settings_text(message.chat.id))
+
+
+@router.message(Command("report"))
+async def report_command(message: Message) -> None:
+    await message.answer(format_period_report(message.chat.id, 1)[0])
+
+
+@router.message(Command("week"))
+async def week_command(message: Message) -> None:
+    await message.answer(format_period_report(message.chat.id, 7)[0])
+
+
+def personal_stats(chat_id: int) -> str:
+    mine = my_results(chat_id)
+    if not mine:
+        return "\n\n<i>Ваших отмеченных сделок пока нет — нажимайте «Я вошёл» под сигналом.</i>"
+    return (
+        f"\n\n<b>Ваши сделки («Я вошёл»):</b> {len(mine)} · в плюс {sum(1 for r in mine if r > 0)} · "
+        f"итог {sum(mine):+.1f}R"
+    )
+
+
 @router.message(Command("stats"))
 async def stats_command(message: Message) -> None:
     rows = store.journal()
@@ -523,6 +915,7 @@ async def stats_command(message: Message) -> None:
         f"Сумма: {total:+.1f}R · среднее {total / len(results):+.2f}R\n"
         f"Макс. просадка: {drawdown:.1f}R\n"
         "<i>1R = сумма риска на сделку, без учёта комиссий.</i>"
+        + personal_stats(message.chat.id)
     )
 
 
@@ -562,6 +955,7 @@ async def status_command(message: Message) -> None:
         lines.append("\nОткрытых сигналов нет — ждём подходящую свечу 4h.")
     deposit, risk_pct = store.get_settings(message.chat.id)
     lines.append(f"\nДепозит ${deposit:g} · риск {risk_pct:g}%")
+    lines.append(feed_status())
     await message.answer("\n".join(lines))
 
 
@@ -573,11 +967,25 @@ async def run() -> None:
 
     async with Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)) as bot:
         engine.event_handler = lambda event: handle_market_event(bot, event)
+        background = None
         try:
             await start_market_data()
+            LAST["tick"] = time.monotonic()
+            background = asyncio.create_task(background_loop(bot))
+
+            async def started(_: int) -> str:
+                return (
+                    "♻️ <b>Бот запущен</b> и получает данные Bybit.\n"
+                    "Если до перезапуска у вас были открытые сделки, следите за ними по бирже: "
+                    "TP/SL на бирже сработают сами, а бот о них уже не напишет."
+                )
+
+            await notify_subscribers(bot, started)
             logger.info("Telegram bot started. Send /start to subscribe.")
             await dispatcher.start_polling(bot)
         finally:
+            if background:
+                background.cancel()
             engine.event_handler = None
             stop_market_data()
 
