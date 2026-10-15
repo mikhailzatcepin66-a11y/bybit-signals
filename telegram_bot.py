@@ -12,7 +12,15 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import Message
+from aiogram import F
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 
@@ -288,8 +296,61 @@ HELP = (
     "/risk 1 — риск на сделку в % депозита (0.25–2)\n"
     "/stats — результаты закрытых сигналов\n"
     "/stop — отключить уведомления\n\n"
-    "Сигналов немного (в среднем 1–3 в неделю), каждый приходит с готовой инструкцией."
+    "Сигналов в среднем 2–4 в неделю (по свечам 4ч), каждый приходит с готовой инструкцией."
 )
+
+
+MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="?? ??????"), KeyboardButton(text="?? ??????????")],
+        [KeyboardButton(text="?? ??????? ? ????"), KeyboardButton(text="?? ??????")],
+    ],
+    resize_keyboard=True,
+)
+
+
+def settings_keyboard() -> InlineKeyboardMarkup:
+    deposits = [InlineKeyboardButton(text=f"${v}", callback_data=f"dep:{v}") for v in (20, 50, 100, 500)]
+    risks = [InlineKeyboardButton(text=f"{v}%", callback_data=f"risk:{v}") for v in (0.5, 1, 1.5, 2)]
+    return InlineKeyboardMarkup(inline_keyboard=[deposits, risks])
+
+
+@router.message(F.text == "?? ??????")
+async def menu_status(message: Message) -> None:
+    await status_command(message)
+
+
+@router.message(F.text == "?? ??????????")
+async def menu_stats(message: Message) -> None:
+    await stats_command(message)
+
+
+@router.message(F.text == "?? ??????")
+async def menu_help(message: Message) -> None:
+    await message.answer(HELP)
+
+
+@router.message(F.text == "?? ??????? ? ????")
+async def menu_settings(message: Message) -> None:
+    deposit, risk_pct = store.get_settings(message.chat.id)
+    await message.answer(
+        f"??????: ??????? <b>${deposit:g}</b>, ???? <b>{risk_pct:g}%</b>.\n"
+        "??????? ??? ? ???????, ?????? ? ???? ?? ??????. ???? ???????: /deposit 75",
+        reply_markup=settings_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith(("dep:", "risk:")))
+async def settings_callback(query: CallbackQuery) -> None:
+    kind, _, raw = (query.data or "").partition(":")
+    store.set_setting(query.from_user.id, "deposit" if kind == "dep" else "risk_pct", float(raw))
+    deposit, risk_pct = store.get_settings(query.from_user.id)
+    await query.answer("?????????")
+    if query.message:
+        await query.message.edit_text(
+            f"??????: ??????? <b>${deposit:g}</b>, ???? <b>{risk_pct:g}%</b>.",
+            reply_markup=settings_keyboard(),
+        )
 
 
 @router.message(CommandStart())
@@ -301,7 +362,8 @@ async def start_command(message: Message) -> None:
     deposit, risk_pct = store.get_settings(message.chat.id)
     await message.answer(
         f"Вы подписаны. Депозит ${deposit:g}, риск {risk_pct:g}% на сделку.\n"
-        "Измените: /deposit 100 и /risk 1.\n\n" + HELP
+        "Измените кнопкой «💰 Депозит и риск».\n\n" + HELP,
+        reply_markup=MENU,
     )
 
 

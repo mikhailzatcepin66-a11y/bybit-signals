@@ -25,7 +25,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bybit-signals")
 
-SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT")
+SYMBOLS = (
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "LTCUSDT",
+)
 INTERVALS = (strategy.TIMEFRAME,)
 HISTORY_LIMIT = 300
 STATIC_DIR = Path(__file__).parent / "static"
